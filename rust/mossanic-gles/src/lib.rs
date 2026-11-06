@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
 use khronos_egl as egl;
+use glow::HasContext; // Required to use gl.clear() and gl.clear_color()
 
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
@@ -32,7 +33,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceGLES(
             env.get_native_interface() as *mut _,
             surface.as_raw() as *mut _
         ).unwrap();
-        
+
         let window_ptr = window.ptr().as_ptr() as usize;
         std::mem::forget(window);
 
@@ -46,7 +47,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceGLES(
 
 unsafe fn run_gles(window_ptr: usize) {
     let egl = egl::DynamicInstance::<egl::EGL1_4>::load_required().expect("Failed to load EGL");
-    
+
     // 1. Get Display
     let display = egl.get_display(egl::DEFAULT_DISPLAY).expect("Failed to get EGL display");
     let mut major = 0;
@@ -73,8 +74,8 @@ unsafe fn run_gles(window_ptr: usize) {
     ];
     let context = egl.create_context(display, config, None, &context_attribs).expect("Failed to create context");
 
-    // 4. Create Surface
-    let surface = egl.create_window_surface(display, config, window_ptr as egl::NativeWindowType, None).expect("Failed to create window surface");
+    // 4. Create Surface (cast window_ptr to the raw window type EGL expects)
+    let surface = egl.create_window_surface(display, config, window_ptr as *mut _, None).expect("Failed to create window surface");
 
     // 5. Make Current
     egl.make_current(display, Some(surface), Some(surface), Some(context)).expect("Failed to make current");
@@ -88,12 +89,11 @@ unsafe fn run_gles(window_ptr: usize) {
 
     // 7. Render Loop
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
-        unsafe {
-            gl.clear_color(0.0, 1.0, 0.0, 1.0); // Green
-            gl.clear(glow::COLOR_BUFFER_BIT);
-        }
-        egl.swap_buffers(display, surface).expect("Failed to swap buffers");
+        gl.clear_color(0.0, 1.0, 0.0, 1.0); // Green
+        gl.clear(glow::COLOR_BUFFER_BIT);
         
+        egl.swap_buffers(display, surface).expect("Failed to swap buffers");
+
         // Add a tiny sleep to prevent 100% CPU spin on older devices
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
