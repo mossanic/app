@@ -1,6 +1,6 @@
 [package]
 name = "mossanic-renderer"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 
 [lib]
@@ -15,6 +15,3 @@ android_logger = "0.14"
 once_cell = "1.20"
 swash = "0.1.18"
 bytemuck = { version = "1.14", features = ["derive"] }
-
-[build-dependencies]
-shaderc = "0.8"
