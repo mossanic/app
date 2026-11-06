@@ -13,7 +13,7 @@ static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
 pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurface(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     surface: JObject,
 ) {
@@ -71,21 +71,21 @@ unsafe fn run_vulkan(window_ptr: usize) {
     // 1. Instance
     let app_name = CString::new("MossanicSpike").unwrap();
     let app_info = vk::ApplicationInfo {
-        application_name: &app_name,
+        p_application_name: app_name.as_ptr(),
         api_version: vk::make_api_version(0, 1, 1, 0),
         ..Default::default()
     };
 
+    // ash 0.38 uses static NAME constants for extensions
     let instance_exts = [
-        ash::khr::surface::Instance::name(),
-        ash::khr::android_surface::Instance::name(),
+        ash::khr::surface::NAME.as_ptr(),
+        ash::khr::android_surface::NAME.as_ptr(),
     ];
-    let instance_ext_ptrs: Vec<*const i8> = instance_exts.iter().map(|s| s.as_ptr()).collect();
 
     let instance_create_info = vk::InstanceCreateInfo {
         p_application_info: &app_info,
         enabled_extension_count: instance_exts.len() as u32,
-        pp_enabled_extension_names: instance_ext_ptrs.as_ptr(),
+        pp_enabled_extension_names: instance_exts.as_ptr(),
         ..Default::default()
     };
 
@@ -123,14 +123,15 @@ unsafe fn run_vulkan(window_ptr: usize) {
         ..Default::default()
     };
 
-    let device_exts = [ash::khr::swapchain::Device::name()];
-    let device_ext_ptrs: Vec<*const i8> = device_exts.iter().map(|s| s.as_ptr()).collect();
+    let device_exts = [
+        ash::khr::swapchain::NAME.as_ptr()
+    ];
 
     let device_create_info = vk::DeviceCreateInfo {
         queue_create_info_count: 1,
         p_queue_create_infos: &queue_create_info,
         enabled_extension_count: device_exts.len() as u32,
-        pp_enabled_extension_names: device_ext_ptrs.as_ptr(),
+        pp_enabled_extension_names: device_exts.as_ptr(),
         ..Default::default()
     };
 
@@ -351,4 +352,4 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     device.device_wait_idle().unwrap();
     log::info!("Render loop exited.");
-            }
+}
