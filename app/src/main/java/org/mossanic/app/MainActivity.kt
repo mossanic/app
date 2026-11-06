@@ -13,6 +13,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         
         System.loadLibrary("mossanic_renderer")
+        System.loadLibrary("mossanic_gles")
         
         surfaceView = SurfaceView(this)
         setContentView(surfaceView)
