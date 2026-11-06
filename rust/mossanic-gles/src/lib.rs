@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
 use khronos_egl as egl;
-use glow::HasContext; // Required to use gl.clear() and gl.clear_color()
+use glow::HasContext;
 
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
@@ -24,7 +24,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceGLES(
 
     let mut init_guard = VULKAN_INIT.lock().unwrap();
     if *init_guard {
-        return 1; // true
+        return 1;
     }
     *init_guard = true;
 
@@ -42,7 +42,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceGLES(
             run_gles(window_ptr);
         });
     }
-    1 // true
+    1
 }
 
 unsafe fn run_gles(window_ptr: usize) {
@@ -50,12 +50,12 @@ unsafe fn run_gles(window_ptr: usize) {
 
     // 1. Get Display
     let display = egl.get_display(egl::DEFAULT_DISPLAY).expect("Failed to get EGL display");
-    let mut major = 0;
-    let mut minor = 0;
-    egl.initialize(display, &mut major, &mut minor).expect("Failed to initialize EGL");
+
+    // 2. Initialize — returns (major, minor) directly
+    let (major, minor) = egl.initialize(display).expect("Failed to initialize EGL");
     log::info!("EGL Version {}.{}", major, minor);
 
-    // 2. Choose Config
+    // 3. Choose Config
     let config_attribs = [
         egl::RED_SIZE, 8,
         egl::GREEN_SIZE, 8,
@@ -67,34 +67,33 @@ unsafe fn run_gles(window_ptr: usize) {
     ];
     let config = egl.choose_first_config(display, &config_attribs).expect("Failed to choose config").unwrap();
 
-    // 3. Create Context
+    // 4. Create Context
     let context_attribs = [
         egl::CONTEXT_CLIENT_VERSION, 2,
         egl::NONE,
     ];
     let context = egl.create_context(display, config, None, &context_attribs).expect("Failed to create context");
 
-    // 4. Create Surface (cast window_ptr to the raw window type EGL expects)
+    // 5. Create Surface
     let surface = egl.create_window_surface(display, config, window_ptr as *mut _, None).expect("Failed to create window surface");
 
-    // 5. Make Current
+    // 6. Make Current
     egl.make_current(display, Some(surface), Some(surface), Some(context)).expect("Failed to make current");
 
-    // 6. Load GL Functions
+    // 7. Load GL Functions
     let gl = glow::Context::from_loader_function(|s| {
         egl.get_proc_address(s).map(|p| p as *const _).unwrap_or(std::ptr::null())
     });
 
     log::info!("Entering render loop (Green Screen).");
 
-    // 7. Render Loop
+    // 8. Render Loop
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         gl.clear_color(0.0, 1.0, 0.0, 1.0); // Green
         gl.clear(glow::COLOR_BUFFER_BIT);
-        
+
         egl.swap_buffers(display, surface).expect("Failed to swap buffers");
 
-        // Add a tiny sleep to prevent 100% CPU spin on older devices
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 
