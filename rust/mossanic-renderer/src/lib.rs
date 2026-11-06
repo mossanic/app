@@ -66,7 +66,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_resize(
 }
 
 unsafe fn run_vulkan(window_ptr: usize) {
-    let entry = Entry::linked();
+    let entry = unsafe { Entry::load().expect("Failed to load Vulkan") };
 
     // 1. Instance
     let app_name = CString::new("MossanicSpike").unwrap();
