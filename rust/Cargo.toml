@@ -1,3 +1,6 @@
 [workspace]
-members = ["mossanic-renderer"]
+members = [
+    "mossanic-renderer",
+    "mossanic-gles"
+]
 resolver = "2"
