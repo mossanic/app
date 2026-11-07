@@ -133,13 +133,14 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let font = swash::FontRef::from_index(font_data, 0).unwrap();
     let mut context = swash::scale::ScaleContext::new();
     let mut scaler = context.builder(font).size(32.0).build();
+    let mut render = swash::scale::Render::new(&[]);
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
     let text = "hello world!";
 
     for (i, c) in text.chars().enumerate() {
         let glyph_id = font.charmap().map(c);
-        if let Some(image) = scaler.scale(glyph_id) {
+        if let Some(image) = render.render(&mut scaler, glyph_id) {
             let w = image.placement.width as usize;
             let h = image.placement.height as usize;
             let ox = (i * 20) as i32 + 50;

@@ -4,8 +4,6 @@ layout(location = 1) in vec2 in_uv;
 layout(location = 0) out vec2 out_uv;
 
 void main() {
-    // Transform pixel coords to Vulkan clip space (-1 to 1)
-    // Note: We flip the Y axis because Vulkan has Y pointing down
     gl_Position = vec4((in_pos.x / 800.0) * 2.0 - 1.0, (in_pos.y / 600.0) * 2.0 - 1.0, 0.0, 1.0);
     out_uv = in_uv;
 }
