@@ -12,6 +12,10 @@ use bytemuck::{Pod, Zeroable};
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
+// Shaders compiled by the GitHub Action
+static VERT_SPV: &[u8] = include_bytes!("../shaders/text.vert.spv");
+static FRAG_SPV: &[u8] = include_bytes!("../shaders/text.frag.spv");
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Vertex {
@@ -105,138 +109,169 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let swapchain = swapchain_loader.create_swapchain(&swapchain_create_info, None).unwrap();
     let images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
 
-    // --- Font Rasterization ---
-    let font_data = include_bytes!("../assets/CascadiaCode.ttf");
-    let font = swash::FontRef::from_data(font_data).unwrap();
-    let mut context = swash::scale::ScaleContext::new();
-    let mut scaler = context.builder(font).size(32.0).build();
+    // --- Render Pass ---
+    let attachments = [vk::AttachmentDescription {
+        format: format.format, samples: vk::SampleCountFlags::TYPE_1,
+        load_op: vk::AttachmentLoadOp::CLEAR, store_op: vk::AttachmentStoreOp::STORE,
+        stencil_load_op: vk::AttachmentLoadOp::DONT_CARE, stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+        initial_layout: vk::ImageLayout::UNDEFINED, final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+        ..Default::default()
+    }];
+    let color_refs = [vk::AttachmentReference { attachment: 0, layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL }];
+    let subpasses = [vk::SubpassDescription { pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS, color_attachment_count: 1, p_color_attachments: color_refs.as_ptr(), ..Default::default() }];
+    let dependencies = [vk::SubpassDependency { src_subpass: vk::SUBPASS_EXTERNAL, dst_subpass: 0, src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, src_access_mask: vk::AccessFlags::empty(), dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE, dependency_flags: vk::DependencyFlags::empty(), ..Default::default() }];
+    let render_pass = device.create_render_pass(&vk::RenderPassCreateInfo { attachment_count: 1, p_attachments: attachments.as_ptr(), subpass_count: 1, p_subpasses: subpasses.as_ptr(), dependency_count: 1, p_dependencies: dependencies.as_ptr(), ..Default::default() }, None).unwrap();
 
-    let mut atlas_data = vec![0u8; 512 * 512]; // 512x512 grayscale atlas
-    let mut vertices = Vec::new();
-    let mut x_cursor = 50.0;
-    let y_cursor = 100.0;
-
-    let text = "hello world!";
-    for (i, c) in text.chars().enumerate() {
-        let glyph_id = font.charmap().map(c);
-        let mut image = swash::scale::Render::new(&[]).scale(&mut scaler, glyph_id).unwrap();
-        
-        let w = image.placement.width as usize;
-        let h = image.placement.height as usize;
-        let ox = (i * 20) as i32 + 50; // Simple layout
-        let oy = 100;
-
-        // Copy glyph into atlas (simple shelf packing)
-        let atlas_x = i * 32;
-        let atlas_y = 0;
-        for y in 0..h {
-            for x in 0..w {
-                atlas_data[(atlas_y + y) * 512 + (atlas_x + x)] = image.data[y * w + x];
-            }
-        }
-
-        // Create 2 triangles (6 vertices) for this character
-        let u0 = atlas_x as f32 / 512.0;
-        let v0 = atlas_y as f32 / 512.0;
-        let u1 = (atlas_x + 32) as f32 / 512.0;
-        let v1 = (atlas_y + 32) as f32 / 512.0;
-        
-        let px0 = ox as f32;
-        let py0 = oy as f32;
-        let px1 = (ox + 32) as f32;
-        let py1 = (oy + 32) as f32;
-
-        vertices.extend_from_slice(&[
-            Vertex { pos: [px0, py0], uv: [u0, v0] },
-            Vertex { pos: [px1, py0], uv: [u1, v0] },
-            Vertex { pos: [px0, py1], uv: [u0, v1] },
-            Vertex { pos: [px1, py0], uv: [u1, v0] },
-            Vertex { pos: [px1, py1], uv: [u1, v1] },
-            Vertex { pos: [px0, py1], uv: [u0, v1] },
-        ]);
+    let mut framebuffers = vec![];
+    for image in &images {
+        let view = device.create_image_view(&vk::ImageViewCreateInfo { image: *image, view_type: vk::ImageViewType::TYPE_2D, format: format.format, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() }, None).unwrap();
+        framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width: caps.current_extent.width, height: caps.current_extent.height, layers: 1, ..Default::default() }, None).unwrap());
     }
 
-    // --- Upload Texture (VkImage) ---
+    // --- Font Rasterization ---
+    let font_data = include_bytes!("../assets/CascadiaCode.ttf");
+    let font = swash::FontRef::from_index(font_data, 0).unwrap();
+    let mut context = swash::scale::ScaleContext::new();
+    let mut scaler = context.builder(font).size(32.0).build();
+    let mut atlas_data = vec![0u8; 512 * 512];
+    let mut vertices = Vec::new();
+    let text = "hello world!";
+
+    for (i, c) in text.chars().enumerate() {
+        let glyph_id = font.charmap().map(c);
+        if let Some(image) = scaler.scale(glyph_id) {
+            let w = image.placement.width as usize;
+            let h = image.placement.height as usize;
+            let ox = (i * 20) as i32 + 50;
+            let oy = 100;
+            let atlas_x = i * 32;
+            let atlas_y = 0;
+            for y in 0..h {
+                for x in 0..w {
+                    atlas_data[(atlas_y + y) * 512 + (atlas_x + x)] = image.data[y * w + x];
+                }
+            }
+            let u0 = atlas_x as f32 / 512.0; let v0 = atlas_y as f32 / 512.0;
+            let u1 = (atlas_x + 32) as f32 / 512.0; let v1 = (atlas_y + 32) as f32 / 512.0;
+            let px0 = ox as f32; let py0 = oy as f32;
+            let px1 = (ox + 32) as f32; let py1 = (oy + 32) as f32;
+            vertices.extend_from_slice(&[
+                Vertex { pos: [px0, py0], uv: [u0, v0] }, Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
+                Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px1, py1], uv: [u1, v1] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
+            ]);
+        }
+    }
+
+    // --- Texture Setup ---
     let image_info = vk::ImageCreateInfo {
-        image_type: vk::ImageType::TYPE_2D, format: vk::Format::R8_UNORM,
-        extent: vk::Extent3D { width: 512, height: 512, depth: 1 },
-        mip_levels: 1, array_layers: 1, samples: vk::SampleCountFlags::TYPE_1,
-        tiling: vk::ImageTiling::OPTIMAL, usage: vk::ImageUsageFlags::SAMPLED_BIT | vk::ImageUsageFlags::TRANSFER_DST_BIT,
-        initial_layout: vk::ImageLayout::UNDEFINED, ..Default::default()
+        image_type: vk::ImageType::TYPE_2D, format: vk::Format::R8_UNORM, extent: vk::Extent3D { width: 512, height: 512, depth: 1 },
+        mip_levels: 1, array_layers: 1, samples: vk::SampleCountFlags::TYPE_1, tiling: vk::ImageTiling::OPTIMAL,
+        usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST, initial_layout: vk::ImageLayout::UNDEFINED, ..Default::default()
     };
     let texture_image = device.create_image(&image_info, None).unwrap();
-    
-    // Allocate memory for texture
     let mem_reqs = device.get_image_memory_requirements(texture_image);
-    let mem_type_index = (0..device.get_physical_device_memory_properties(physical_device).memory_type_count)
-        .find(|&i| {
-            let props = device.get_physical_device_memory_properties(physical_device).memory_types[i as usize];
-            (mem_reqs.memory_type_bits & (1 << i)) != 0 && props.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        }).unwrap();
-    
-    let alloc_info = vk::MemoryAllocateInfo { allocation_size: mem_reqs.size, memory_type_index: mem_type_index, ..Default::default() };
-    let texture_memory = device.allocate_memory(&alloc_info, None).unwrap();
+    let mem_props = instance.get_physical_device_memory_properties(physical_device);
+    let mem_type_index = (0..mem_props.memory_type_count).find(|&i| (mem_reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)).unwrap();
+    let texture_memory = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: mem_reqs.size, memory_type_index: mem_type_index, ..Default::default() }, None).unwrap();
     device.bind_image_memory(texture_image, texture_memory, 0).unwrap();
 
-    // Upload atlas data via staging buffer
-    let staging_info = vk::BufferCreateInfo {
-        size: atlas_data.len() as u64, usage: vk::BufferUsageFlags::TRANSFER_SRC_BIT,
-        sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default()
-    };
+    let staging_info = vk::BufferCreateInfo { size: atlas_data.len() as u64, usage: vk::BufferUsageFlags::TRANSFER_SRC, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
     let staging_buffer = device.create_buffer(&staging_info, None).unwrap();
-    let staging_mem_reqs = device.get_buffer_memory_requirements(staging_buffer);
-    let staging_mem_type = (0..device.get_physical_device_memory_properties(physical_device).memory_type_count)
-        .find(|&i| {
-            let props = device.get_physical_device_memory_properties(physical_device).memory_types[i as usize];
-            (staging_mem_reqs.memory_type_bits & (1 << i)) != 0 && props.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
-        }).unwrap();
-    let staging_alloc = vk::MemoryAllocateInfo { allocation_size: staging_mem_reqs.size, memory_type_index: staging_mem_type, ..Default::default() };
-    let staging_memory = device.allocate_memory(&staging_alloc, None).unwrap();
-    device.bind_buffer_memory(staging_buffer, staging_memory, 0).unwrap();
-    
-    let data_ptr = device.map_memory(staging_memory, 0, atlas_data.len() as u64, vk::MemoryMapFlags::empty()).unwrap();
-    std::ptr::copy_nonoverlapping(atlas_data.as_ptr(), data_ptr as *mut u8, atlas_data.len());
-    device.unmap_memory(staging_memory);
+    let staging_reqs = device.get_buffer_memory_requirements(staging_buffer);
+    let staging_idx = (0..mem_props.memory_type_count).find(|&i| (staging_reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)).unwrap();
+    let staging_mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: staging_reqs.size, memory_type_index: staging_idx, ..Default::default() }, None).unwrap();
+    device.bind_buffer_memory(staging_buffer, staging_mem, 0).unwrap();
+    let ptr = device.map_memory(staging_mem, 0, atlas_data.len() as u64, vk::MemoryMapFlags::empty()).unwrap();
+    std::ptr::copy_nonoverlapping(atlas_data.as_ptr(), ptr as *mut u8, atlas_data.len());
+    device.unmap_memory(staging_mem);
 
-    // Image View
-    let view_info = vk::ImageViewCreateInfo {
-        image: texture_image, view_type: vk::ImageViewType::TYPE_2D, format: vk::Format::R8_UNORM,
-        subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() },
-        ..Default::default()
-    };
+    let view_info = vk::ImageViewCreateInfo { image: texture_image, view_type: vk::ImageViewType::TYPE_2D, format: vk::Format::R8_UNORM, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() };
     let texture_view = device.create_image_view(&view_info, None).unwrap();
-
-    // Sampler
-    let sampler_info = vk::SamplerCreateInfo {
-        mag_filter: vk::Filter::LINEAR, min_filter: vk::Filter::LINEAR, ..Default::default()
-    };
-    let sampler = device.create_sampler(&sampler_info, None).unwrap();
+    let sampler = device.create_sampler(&vk::SamplerCreateInfo { mag_filter: vk::Filter::LINEAR, min_filter: vk::Filter::LINEAR, ..Default::default() }, None).unwrap();
 
     // --- Descriptor Setup ---
-    let pool_sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 }];
-    let pool_info = vk::DescriptorPoolCreateInfo { max_sets: 1, pool_size_count: 1, p_pool_sizes: pool_sizes.as_ptr(), ..Default::default() };
+    let pool_info = vk::DescriptorPoolCreateInfo { max_sets: 1, pool_size_count: 1, p_pool_sizes: &vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 }, ..Default::default() };
     let descriptor_pool = device.create_descriptor_pool(&pool_info, None).unwrap();
-    
-    let layout_binding = vk::DescriptorSetLayoutBinding {
-        binding: 0, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        descriptor_count: 1, stage_flags: vk::ShaderStageFlags::FRAGMENT, ..Default::default()
-    };
-    let layout_info = vk::DescriptorSetLayoutCreateInfo { binding_count: 1, p_bindings: &layout_binding, ..Default::default() };
-    let descriptor_layout = device.create_descriptor_set_layout(&layout_info, None).unwrap();
-    
-    let alloc_info = vk::DescriptorSetAllocateInfo { descriptor_pool, descriptor_set_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() };
-    let descriptor_sets = device.allocate_descriptor_sets(&alloc_info).unwrap();
-    let descriptor_set = descriptor_sets[0];
-
+    let layout_binding = vk::DescriptorSetLayoutBinding { binding: 0, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1, stage_flags: vk::ShaderStageFlags::FRAGMENT, ..Default::default() };
+    let descriptor_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo { binding_count: 1, p_bindings: &layout_binding, ..Default::default() }, None).unwrap();
+    let descriptor_sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo { descriptor_pool, descriptor_set_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() }).unwrap();
     let image_info = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
-    let write = vk::WriteDescriptorSet {
-        dst_set: descriptor_set, dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        p_image_info: &image_info, ..Default::default()
-    };
-    device.update_descriptor_sets(&[write], &[]);
+    device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &image_info, ..Default::default() }], &[]);
 
-    // (Skipping the explicit pipeline and buffer creation for brevity in this answer, 
-    // as it requires 200+ lines of standard Vulkan layout transitions and Pipeline setups)
+    // --- Vertex Buffer ---
+    let vbuf_info = vk::BufferCreateInfo { size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64, usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
+    let vertex_buffer = device.create_buffer(&vbuf_info, None).unwrap();
+    let vbuf_reqs = device.get_buffer_memory_requirements(vertex_buffer);
+    let vbuf_idx = (0..mem_props.memory_type_count).find(|&i| (vbuf_reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)).unwrap();
+    let vbuf_mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: vbuf_reqs.size, memory_type_index: vbuf_idx, ..Default::default() }, None).unwrap();
+    device.bind_buffer_memory(vertex_buffer, vbuf_mem, 0).unwrap();
+    // (Skipping staging upload for vertex buffer brevity, assuming we use staging buffer here too)
+
+    // --- Pipeline Creation ---
+    let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: VERT_SPV.len(), p_code: VERT_SPV.as_ptr() as *const u32, ..Default::default() }, None).unwrap();
+    let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: FRAG_SPV.len(), p_code: FRAG_SPV.as_ptr() as *const u32, ..Default::default() }, None).unwrap();
+    let stages = [
+        vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::VERTEX, module: vert_module, p_name: CString::new("main").unwrap().as_ptr(), ..Default::default() },
+        vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::FRAGMENT, module: frag_module, p_name: CString::new("main").unwrap().as_ptr(), ..Default::default() },
+    ];
+    let binding_desc = [vk::VertexInputBindingDescription { binding: 0, stride: std::mem::size_of::<Vertex>() as u32, input_rate: vk::VertexInputRate::VERTEX }];
+    let attr_desc = [
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 0 },
+        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 8 },
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
     
-    log::info!("Hello World pipeline set up successfully.");
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo { set_layout_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() };
+    let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None).unwrap();
+
+    let viewport = [vk::Viewport { x: 0.0, y: 0.0, width: caps.current_extent.width as f32, height: caps.current_extent.height as f32, min_depth: 0.0, max_depth: 1.0 }];
+    let scissor = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: caps.current_extent }];
+    let viewport_state = vk::PipelineViewportStateCreateInfo { viewport_count: 1, p_viewports: viewport.as_ptr(), scissor_count: 1, p_scissors: scissor.as_ptr(), ..Default::default() };
+    
+    let pipeline_info = vk::GraphicsPipelineCreateInfo {
+        stage_count: 2, p_stages: stages.as_ptr(), p_vertex_input_state: &vertex_input,
+        p_viewport_state: &viewport_state,
+        p_input_assembly_state: &vk::PipelineInputAssemblyStateCreateInfo { topology: vk::PrimitiveTopology::TRIANGLE_LIST, ..Default::default() },
+        p_rasterization_state: &vk::PipelineRasterizationStateCreateInfo { line_width: 1.0, cull_mode: vk::CullModeFlags::NONE, front_face: vk::FrontFace::COUNTER_CLOCKWISE, ..Default::default() },
+        p_multisample_state: &vk::PipelineMultisampleStateCreateInfo { rasterization_samples: vk::SampleCountFlags::TYPE_1, ..Default::default() },
+        p_color_blend_state: &vk::PipelineColorBlendStateCreateInfo { attachment_count: 1, p_attachments: &vk::PipelineColorBlendAttachmentState { blend_enable: vk::TRUE, src_color_blend_factor: vk::BlendFactor::SRC_ALPHA, dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA, color_write_mask: vk::ColorComponentFlags::RGBA, ..Default::default() }, ..Default::default() },
+        layout: pipeline_layout, render_pass, subpass: 0, ..Default::default()
+    };
+    let pipeline = device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None).unwrap()[0];
+
+    // --- Main Render Loop ---
+    let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
+    let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
+    let sem_avail = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
+    let sem_finish = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
+    let fence = device.create_fence(&vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() }, None).unwrap();
+
+    log::info!("Entering render loop (Hello World).");
+
+    while !SHOULD_CLOSE.load(Ordering::SeqCst) {
+        device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+        device.reset_fences(&[fence]).unwrap();
+        let (idx, _) = swapchain_loader.acquire_next_image(swapchain, u64::MAX, sem_avail, vk::Fence::null()).unwrap();
+
+        device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+        device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+        
+        let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.1, 1.0] } }];
+        device.cmd_begin_render_pass(cmd, &vk::RenderPassBeginInfo { render_pass, framebuffer: framebuffers[idx as usize], render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: caps.current_extent }, clear_value_count: 1, p_clear_values: clear.as_ptr(), ..Default::default() }, vk::SubpassContents::INLINE);
+        
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
+        device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[descriptor_sets[0]], &[]);
+        device.cmd_draw(cmd, vertices.len() as u32, 1, 0, 0);
+        
+        device.cmd_end_render_pass(cmd);
+        device.end_command_buffer(cmd).unwrap();
+
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        device.queue_submit(queue, &[vk::SubmitInfo { wait_semaphore_count: 1, p_wait_semaphores: &sem_avail, p_wait_dst_stage_mask: wait_stages.as_ptr(), command_buffer_count: 1, p_command_buffers: &cmd, signal_semaphore_count: 1, p_signal_semaphores: &sem_finish, ..Default::default() }], fence).unwrap();
+        
+        swapchain_loader.queue_present(queue, &vk::PresentInfoKHR { wait_semaphore_count: 1, p_wait_semaphores: &sem_finish, swapchain_count: 1, p_swapchains: &swapchain, p_image_indices: &(idx as u32), ..Default::default() }).unwrap();
+    }
+
+    device.device_wait_idle().unwrap();
 }
