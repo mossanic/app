@@ -12,7 +12,6 @@ use bytemuck::{Pod, Zeroable};
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
-// Shaders compiled by the GitHub Action
 static VERT_SPV: &[u8] = include_bytes!("../shaders/text.vert.spv");
 static FRAG_SPV: &[u8] = include_bytes!("../shaders/text.frag.spv");
 
@@ -25,10 +24,15 @@ struct Vertex {
 
 #[no_mangle]
 pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
-    log::info!("JNI: setSurfaceVulkan called");
     env: JNIEnv, _class: JClass, surface: JObject,
 ) -> jni::sys::jboolean {
-    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("MossanicRust"));
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Trace)
+            .with_tag("MossanicRust"),
+    );
+    log::info!("JNI: setSurfaceVulkan called");
+
     let mut init_guard = VULKAN_INIT.lock().unwrap();
     if *init_guard { return 1; }
     *init_guard = true;
@@ -50,7 +54,6 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
         SHOULD_CLOSE.store(false, Ordering::SeqCst);
         
         thread::spawn(move || {
-            // Catch panics so the thread doesn't die silently
             let result = std::panic::catch_unwind(|| {
                 run_vulkan(window_ptr);
             });
@@ -64,6 +67,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
 
 #[no_mangle]
 pub extern "system" fn Java_org_mossanic_app_NativeBridge_clearSurface(_env: JNIEnv, _class: JClass) {
+    log::info!("JNI: clearSurface called");
     SHOULD_CLOSE.store(true, Ordering::SeqCst);
     *VULKAN_INIT.lock().unwrap() = false;
 }
@@ -72,6 +76,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_clearSurface(_env: JNI
 pub extern "system" fn Java_org_mossanic_app_NativeBridge_resize(_env: JNIEnv, _class: JClass, _w: i32, _h: i32) {}
 
 unsafe fn run_vulkan(window_ptr: usize) {
+    log::info!("Starting Vulkan initialization...");
     let entry = Entry::load().expect("Failed to load Vulkan");
     let app_name = CString::new("MossanicSpike").unwrap();
     let app_info = vk::ApplicationInfo {
@@ -88,6 +93,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         ..Default::default()
     };
     let instance = entry.create_instance(&instance_create_info, None).unwrap();
+    log::info!("Vulkan Instance created");
 
     let android_surface = ash::khr::android_surface::Instance::new(&entry, &instance);
     let surface_create_info = vk::AndroidSurfaceCreateInfoKHR { window: window_ptr as *mut _, ..Default::default() };
@@ -109,8 +115,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let device = instance.create_device(physical_device, &device_create_info, None).unwrap();
     let queue = device.get_device_queue(0, 0);
     let mem_props = instance.get_physical_device_memory_properties(physical_device);
+    log::info!("Vulkan Device created");
 
-    // --- Swapchain Setup ---
     let caps = surface_ext.get_physical_device_surface_capabilities(physical_device, surface).unwrap();
     let formats = surface_ext.get_physical_device_surface_formats(physical_device, surface).unwrap();
     let format = formats[0];
@@ -126,8 +132,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
     let swapchain = swapchain_loader.create_swapchain(&swapchain_create_info, None).unwrap();
     let images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
+    log::info!("Swapchain created");
 
-    // --- Render Pass ---
     let attachments = [vk::AttachmentDescription {
         format: format.format, samples: vk::SampleCountFlags::TYPE_1,
         load_op: vk::AttachmentLoadOp::CLEAR, store_op: vk::AttachmentStoreOp::STORE,
@@ -145,12 +151,12 @@ unsafe fn run_vulkan(window_ptr: usize) {
         let view = device.create_image_view(&vk::ImageViewCreateInfo { image: *image, view_type: vk::ImageViewType::TYPE_2D, format: format.format, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() }, None).unwrap();
         framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width: caps.current_extent.width, height: caps.current_extent.height, layers: 1, ..Default::default() }, None).unwrap());
     }
+    log::info!("Framebuffers created");
 
-    // --- Font Rasterization ---
     let font_data = include_bytes!("../assets/CascadiaCode.ttf");
     let font = swash::FontRef::from_index(font_data, 0).unwrap();
     let mut context = swash::scale::ScaleContext::new();
-    let mut scaler = context.builder(font).size(64.0).build(); // Increased size to 64px for visibility
+    let mut scaler = context.builder(font).size(64.0).build();
     let mut render = swash::scale::Render::new(&[]);
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
@@ -161,46 +167,31 @@ unsafe fn run_vulkan(window_ptr: usize) {
         if let Some(image) = render.render(&mut scaler, glyph_id) {
             let w = image.placement.width as usize;
             let h = image.placement.height as usize;
-            
-            // Layout coordinates in pixel space
             let ox = (i * 40) as i32 + 100;
             let oy = 400;
-            
-            // Pack into atlas
             let atlas_x = i * 64;
             let atlas_y = 0;
-            
             for y in 0..h {
                 for x in 0..w {
                     atlas_data[(atlas_y + y) * 512 + (atlas_x + x)] = image.data[y * w + x];
                 }
             }
-            
-            // UV coordinates for the atlas
             let u0 = atlas_x as f32 / 512.0; let v0 = atlas_y as f32 / 512.0;
             let u1 = (atlas_x + w) as f32 / 512.0; let v1 = (atlas_y + h) as f32 / 512.0;
-            
-            // Pixel coordinates for the quad
             let px0 = ox as f32; let py0 = oy as f32;
             let px1 = (ox + w as i32) as f32; let py1 = (oy + h as i32) as f32;
-            
             vertices.extend_from_slice(&[
                 Vertex { pos: [px0, py0], uv: [u0, v0] }, Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
                 Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px1, py1], uv: [u1, v1] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
             ]);
         }
     }
-    
-    log::info!("Generated {} vertices for text", vertices.len());
-    let checksum: u32 = atlas_data.iter().map(|&x| x as u32).sum();
-    log::info!("Atlas checksum: {}", checksum);
+    log::info!("Generated {} vertices", vertices.len());
 
-    // --- Command Pool ---
     let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
     let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
     device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
-    // --- Texture Setup & Upload ---
     let image_info = vk::ImageCreateInfo {
         image_type: vk::ImageType::TYPE_2D, format: vk::Format::R8_UNORM, extent: vk::Extent3D { width: 512, height: 512, depth: 1 },
         mip_levels: 1, array_layers: 1, samples: vk::SampleCountFlags::TYPE_1, tiling: vk::ImageTiling::OPTIMAL,
@@ -249,7 +240,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let texture_view = device.create_image_view(&view_info, None).unwrap();
     let sampler = device.create_sampler(&vk::SamplerCreateInfo { mag_filter: vk::Filter::LINEAR, min_filter: vk::Filter::LINEAR, ..Default::default() }, None).unwrap();
 
-    // --- Vertex Buffer Setup & Upload ---
     let vbuf_info = vk::BufferCreateInfo { size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64, usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
     let vertex_buffer = device.create_buffer(&vbuf_info, None).unwrap();
     let vbuf_reqs = device.get_buffer_memory_requirements(vertex_buffer);
@@ -275,8 +265,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
     device.queue_submit(queue, &[vk::SubmitInfo { command_buffer_count: 1, p_command_buffers: &cmd, ..Default::default() }], upload_fence).unwrap();
     device.wait_for_fences(&[upload_fence], true, u64::MAX).unwrap();
     device.destroy_fence(upload_fence, None);
+    log::info!("Buffers and textures uploaded");
 
-    // --- Descriptor Setup ---
     let pool_info = vk::DescriptorPoolCreateInfo { max_sets: 1, pool_size_count: 1, p_pool_sizes: &vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 }, ..Default::default() };
     let descriptor_pool = device.create_descriptor_pool(&pool_info, None).unwrap();
     let layout_binding = vk::DescriptorSetLayoutBinding { binding: 0, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1, stage_flags: vk::ShaderStageFlags::FRAGMENT, ..Default::default() };
@@ -285,7 +275,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let image_info = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
     device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &image_info, ..Default::default() }], &[]);
 
-    // --- Pipeline Creation ---
     let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: VERT_SPV.len(), p_code: VERT_SPV.as_ptr() as *const u32, ..Default::default() }, None).unwrap();
     let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: FRAG_SPV.len(), p_code: FRAG_SPV.as_ptr() as *const u32, ..Default::default() }, None).unwrap();
     let stages = [
@@ -316,13 +305,13 @@ unsafe fn run_vulkan(window_ptr: usize) {
         layout: pipeline_layout, render_pass, subpass: 0, ..Default::default()
     };
     let pipeline = device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None).unwrap()[0];
+    log::info!("Graphics Pipeline created");
 
-    // --- Main Render Loop ---
     let sem_avail = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let sem_finish = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let fence = device.create_fence(&vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() }, None).unwrap();
 
-    log::info!("Entering render loop (Hello World).");
+    log::info!("Entering render loop (Red Screen).");
 
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
@@ -332,7 +321,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
         
-        // --- DEBUG: Bright Purple Clear Color ---
         let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [1.0, 0.0, 0.0, 1.0] } }];
         device.cmd_begin_render_pass(cmd, &vk::RenderPassBeginInfo { render_pass, framebuffer: framebuffers[idx as usize], render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: caps.current_extent }, clear_value_count: 1, p_clear_values: clear.as_ptr(), ..Default::default() }, vk::SubpassContents::INLINE);
         
