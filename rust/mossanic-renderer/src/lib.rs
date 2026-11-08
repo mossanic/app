@@ -25,7 +25,7 @@ struct Vertex {
 
 #[no_mangle]
 pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
-    mut env: JNIEnv, _class: JClass, surface: JObject,
+    env: JNIEnv, _class: JClass, surface: JObject,
 ) -> jni::sys::jboolean {
     android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));
     let mut init_guard = VULKAN_INIT.lock().unwrap();
@@ -33,14 +33,30 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
     *init_guard = true;
 
     unsafe {
-        let window = ndk::native_window::NativeWindow::from_surface(
+        let window = match ndk::native_window::NativeWindow::from_surface(
             env.get_native_interface() as *mut _, surface.as_raw() as *mut _
-        ).unwrap();
+        ) {
+            Some(w) => w,
+            None => {
+                log::error!("Failed to create ANativeWindow");
+                *init_guard = false;
+                return 0;
+            }
+        };
         let window_ptr = window.ptr().as_ptr() as usize;
         std::mem::forget(window);
 
         SHOULD_CLOSE.store(false, Ordering::SeqCst);
-        thread::spawn(move || { run_vulkan(window_ptr); });
+        
+        thread::spawn(move || {
+            // Catch panics so the thread doesn't die silently
+            let result = std::panic::catch_unwind(|| {
+                run_vulkan(window_ptr);
+            });
+            if let Err(_) = result {
+                log::error!("VULKAN THREAD PANICKED! Check the logs above.");
+            }
+        });
     }
     1
 }
