@@ -26,6 +26,7 @@ struct Vertex {
 #[no_mangle]
 pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
     env: JNIEnv, _class: JClass, surface: JObject,
+    log::info!("JNI: setSurfaceVulkan called");
 ) -> jni::sys::jboolean {
     android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("MossanicRust"));
     let mut init_guard = VULKAN_INIT.lock().unwrap();
