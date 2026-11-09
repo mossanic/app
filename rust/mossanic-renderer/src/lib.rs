@@ -153,37 +153,53 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }
     log::info!("Framebuffers created");
 
+    // --- Font Rasterization ---
     let font_data = include_bytes!("../assets/CascadiaCode.ttf");
     let font = swash::FontRef::from_index(font_data, 0).unwrap();
     let mut context = swash::scale::ScaleContext::new();
     let mut scaler = context.builder(font).size(64.0).build();
+    
+    // Explicitly set the render format to Alpha (grayscale)
     let mut render = swash::scale::Render::new(&[]);
+    render.format(swash::zeno::Format::Alpha);
+    
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
     let text = "hello world!";
 
     for (i, c) in text.chars().enumerate() {
         let glyph_id = font.charmap().map(c);
+        log::info!("Char: '{}', GlyphID: {:?}", c, glyph_id);
+        
         if let Some(image) = render.render(&mut scaler, glyph_id) {
             let w = image.placement.width as usize;
             let h = image.placement.height as usize;
+            log::info!("  -> Size: {}x{}", w, h);
+
+            if w == 0 || h == 0 { continue; }
+
             let ox = (i * 40) as i32 + 100;
             let oy = 400;
             let atlas_x = i * 64;
             let atlas_y = 0;
+            
             for y in 0..h {
                 for x in 0..w {
                     atlas_data[(atlas_y + y) * 512 + (atlas_x + x)] = image.data[y * w + x];
                 }
             }
+            
             let u0 = atlas_x as f32 / 512.0; let v0 = atlas_y as f32 / 512.0;
             let u1 = (atlas_x + w) as f32 / 512.0; let v1 = (atlas_y + h) as f32 / 512.0;
             let px0 = ox as f32; let py0 = oy as f32;
             let px1 = (ox + w as i32) as f32; let py1 = (oy + h as i32) as f32;
+            
             vertices.extend_from_slice(&[
                 Vertex { pos: [px0, py0], uv: [u0, v0] }, Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
                 Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px1, py1], uv: [u1, v1] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
             ]);
+        } else {
+            log::info!("  -> Failed to render glyph");
         }
     }
     log::info!("Generated {} vertices", vertices.len());
@@ -192,6 +208,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
     device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
+    // --- Texture Setup ---
     let image_info = vk::ImageCreateInfo {
         image_type: vk::ImageType::TYPE_2D, format: vk::Format::R8_UNORM, extent: vk::Extent3D { width: 512, height: 512, depth: 1 },
         mip_levels: 1, array_layers: 1, samples: vk::SampleCountFlags::TYPE_1, tiling: vk::ImageTiling::OPTIMAL,
@@ -240,24 +257,28 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let texture_view = device.create_image_view(&view_info, None).unwrap();
     let sampler = device.create_sampler(&vk::SamplerCreateInfo { mag_filter: vk::Filter::LINEAR, min_filter: vk::Filter::LINEAR, ..Default::default() }, None).unwrap();
 
-    let vbuf_info = vk::BufferCreateInfo { size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64, usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
+    // --- Vertex Buffer Setup (FIX: Prevent 0-byte buffer crash) ---
+    let vbuf_size = if vertices.is_empty() { std::mem::size_of::<Vertex>() as u64 } else { (vertices.len() * std::mem::size_of::<Vertex>()) as u64 };
+    let vbuf_info = vk::BufferCreateInfo { size: vbuf_size, usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
     let vertex_buffer = device.create_buffer(&vbuf_info, None).unwrap();
     let vbuf_reqs = device.get_buffer_memory_requirements(vertex_buffer);
     let vbuf_idx = (0..mem_props.memory_type_count).find(|&i| (vbuf_reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)).unwrap();
     let vbuf_mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: vbuf_reqs.size, memory_type_index: vbuf_idx, ..Default::default() }, None).unwrap();
     device.bind_buffer_memory(vertex_buffer, vbuf_mem, 0).unwrap();
 
-    let v_stage_info = vk::BufferCreateInfo { size: vbuf_info.size, usage: vk::BufferUsageFlags::TRANSFER_SRC, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
-    let v_stage_buf = device.create_buffer(&v_stage_info, None).unwrap();
-    let v_stage_reqs = device.get_buffer_memory_requirements(v_stage_buf);
-    let v_stage_mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: v_stage_reqs.size, memory_type_index: staging_idx, ..Default::default() }, None).unwrap();
-    device.bind_buffer_memory(v_stage_buf, v_stage_mem, 0).unwrap();
-    
-    let v_ptr = device.map_memory(v_stage_mem, 0, vbuf_info.size, vk::MemoryMapFlags::empty()).unwrap();
-    std::ptr::copy_nonoverlapping(vertices.as_ptr(), v_ptr as *mut Vertex, vertices.len());
-    device.unmap_memory(v_stage_mem);
+    if !vertices.is_empty() {
+        let v_stage_info = vk::BufferCreateInfo { size: vbuf_info.size, usage: vk::BufferUsageFlags::TRANSFER_SRC, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
+        let v_stage_buf = device.create_buffer(&v_stage_info, None).unwrap();
+        let v_stage_reqs = device.get_buffer_memory_requirements(v_stage_buf);
+        let v_stage_mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: v_stage_reqs.size, memory_type_index: staging_idx, ..Default::default() }, None).unwrap();
+        device.bind_buffer_memory(v_stage_buf, v_stage_mem, 0).unwrap();
+        
+        let v_ptr = device.map_memory(v_stage_mem, 0, vbuf_info.size, vk::MemoryMapFlags::empty()).unwrap();
+        std::ptr::copy_nonoverlapping(vertices.as_ptr(), v_ptr as *mut Vertex, vertices.len());
+        device.unmap_memory(v_stage_mem);
 
-    device.cmd_copy_buffer(cmd, v_stage_buf, vertex_buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: vbuf_info.size }]);
+        device.cmd_copy_buffer(cmd, v_stage_buf, vertex_buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: vbuf_info.size }]);
+    }
     
     device.end_command_buffer(cmd).unwrap();
     
@@ -311,7 +332,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let sem_finish = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let fence = device.create_fence(&vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() }, None).unwrap();
 
-    log::info!("Entering render loop (Red Screen).");
+    log::info!("Entering render loop (Dark Gray Screen).");
 
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
@@ -321,13 +342,15 @@ unsafe fn run_vulkan(window_ptr: usize) {
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
         
-        let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [1.0, 0.0, 0.0, 1.0] } }];
+        let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.1, 1.0] } }];
         device.cmd_begin_render_pass(cmd, &vk::RenderPassBeginInfo { render_pass, framebuffer: framebuffers[idx as usize], render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: caps.current_extent }, clear_value_count: 1, p_clear_values: clear.as_ptr(), ..Default::default() }, vk::SubpassContents::INLINE);
         
-        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-        device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
-        device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[descriptor_sets[0]], &[]);
-        device.cmd_draw(cmd, vertices.len() as u32, 1, 0, 0);
+        if !vertices.is_empty() {
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[descriptor_sets[0]], &[]);
+            device.cmd_draw(cmd, vertices.len() as u32, 1, 0, 0);
+        }
         
         device.cmd_end_render_pass(cmd);
         device.end_command_buffer(cmd).unwrap();
