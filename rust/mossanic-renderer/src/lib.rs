@@ -154,7 +154,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     log::info!("Framebuffers created");
 
     // --- Font Rasterization ---
-    let font_data = include_bytes!("../assets/CascadiaCode.ttf");
+    let font_data = include_bytes!("../assets/RobotoMono.ttf");
     let font = swash::FontRef::from_index(font_data, 0).unwrap();
     let mut context = swash::scale::ScaleContext::new();
     let mut scaler = context.builder(font).size(64.0).build();
