@@ -154,7 +154,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     log::info!("Framebuffers created");
 
     // --- Debug Font Data ---
-    let font_data = include_bytes!("../assets/RobotoMono.ttf");
+    let font_data = include_bytes!("../assets/JetBrainsMono.ttf");
     log::info!("Font file size: {} bytes", font_data.len());
     log::info!("Font header: {:02X?}", &font_data[0..4]);
 
