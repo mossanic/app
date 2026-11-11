@@ -153,15 +153,22 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }
     log::info!("Framebuffers created");
 
-    // --- Font Rasterization ---
+    // --- Debug Font Data ---
     let font_data = include_bytes!("../assets/RobotoMono.ttf");
-    let font = swash::FontRef::from_index(font_data, 0).unwrap();
+    log::info!("Font file size: {} bytes", font_data.len());
+    log::info!("Font header: {:02X?}", &font_data[0..4]);
+
+    let font = match swash::FontRef::from_index(font_data, 0) {
+        Some(f) => f,
+        None => {
+            log::error!("FATAL: swash could not parse the font.");
+            return;
+        }
+    };
+
     let mut context = swash::scale::ScaleContext::new();
     let mut scaler = context.builder(font).size(64.0).build();
-    
-    // Explicitly set the render format to Alpha (grayscale)
     let mut render = swash::scale::Render::new(&[]);
-    render.format(swash::zeno::Format::Alpha);
     
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
@@ -169,13 +176,9 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     for (i, c) in text.chars().enumerate() {
         let glyph_id = font.charmap().map(c);
-        log::info!("Char: '{}', GlyphID: {:?}", c, glyph_id);
-        
         if let Some(image) = render.render(&mut scaler, glyph_id) {
             let w = image.placement.width as usize;
             let h = image.placement.height as usize;
-            log::info!("  -> Size: {}x{}", w, h);
-
             if w == 0 || h == 0 { continue; }
 
             let ox = (i * 40) as i32 + 100;
@@ -198,8 +201,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
                 Vertex { pos: [px0, py0], uv: [u0, v0] }, Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
                 Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px1, py1], uv: [u1, v1] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
             ]);
-        } else {
-            log::info!("  -> Failed to render glyph");
         }
     }
     log::info!("Generated {} vertices", vertices.len());
@@ -208,7 +209,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
     device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
-    // --- Texture Setup ---
     let image_info = vk::ImageCreateInfo {
         image_type: vk::ImageType::TYPE_2D, format: vk::Format::R8_UNORM, extent: vk::Extent3D { width: 512, height: 512, depth: 1 },
         mip_levels: 1, array_layers: 1, samples: vk::SampleCountFlags::TYPE_1, tiling: vk::ImageTiling::OPTIMAL,
@@ -257,7 +257,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let texture_view = device.create_image_view(&view_info, None).unwrap();
     let sampler = device.create_sampler(&vk::SamplerCreateInfo { mag_filter: vk::Filter::LINEAR, min_filter: vk::Filter::LINEAR, ..Default::default() }, None).unwrap();
 
-    // --- Vertex Buffer Setup (FIX: Prevent 0-byte buffer crash) ---
     let vbuf_size = if vertices.is_empty() { std::mem::size_of::<Vertex>() as u64 } else { (vertices.len() * std::mem::size_of::<Vertex>()) as u64 };
     let vbuf_info = vk::BufferCreateInfo { size: vbuf_size, usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
     let vertex_buffer = device.create_buffer(&vbuf_info, None).unwrap();
@@ -281,7 +280,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }
     
     device.end_command_buffer(cmd).unwrap();
-    
+    log::info!("Command buffer recorded");
+
     let upload_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
     device.queue_submit(queue, &[vk::SubmitInfo { command_buffer_count: 1, p_command_buffers: &cmd, ..Default::default() }], upload_fence).unwrap();
     device.wait_for_fences(&[upload_fence], true, u64::MAX).unwrap();
@@ -295,9 +295,17 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let descriptor_sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo { descriptor_pool, descriptor_set_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() }).unwrap();
     let image_info = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
     device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &image_info, ..Default::default() }], &[]);
+    log::info!("Descriptors created");
 
-    let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: VERT_SPV.len(), p_code: VERT_SPV.as_ptr() as *const u32, ..Default::default() }, None).unwrap();
-    let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: FRAG_SPV.len(), p_code: FRAG_SPV.as_ptr() as *const u32, ..Default::default() }, None).unwrap();
+    let mut vert_words = vec![0u32; (VERT_SPV.len() + 3) / 4];
+    let mut frag_words = vec![0u32; (FRAG_SPV.len() + 3) / 4];
+    std::ptr::copy_nonoverlapping(VERT_SPV.as_ptr(), vert_words.as_mut_ptr() as *mut u8, VERT_SPV.len());
+    std::ptr::copy_nonoverlapping(FRAG_SPV.as_ptr(), frag_words.as_mut_ptr() as *mut u8, FRAG_SPV.len());
+
+    let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: vert_words.len() * 4, p_code: vert_words.as_ptr(), ..Default::default() }, None).unwrap();
+    let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: frag_words.len() * 4, p_code: frag_words.as_ptr(), ..Default::default() }, None).unwrap();
+    log::info!("Shaders created");
+
     let stages = [
         vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::VERTEX, module: vert_module, p_name: CString::new("main").unwrap().as_ptr(), ..Default::default() },
         vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::FRAGMENT, module: frag_module, p_name: CString::new("main").unwrap().as_ptr(), ..Default::default() },
