@@ -164,9 +164,61 @@ unsafe fn run_vulkan(window_ptr: usize) {
         framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width, height, layers: 1, ..Default::default() }, None).unwrap());
     }
 
-    // --- Suzuri Text Layout & Rasterization ---
+    // --- Skrifa: compute actual text width for centering ---
+    use skrifa::instance::{LocationRef, Size};
+    use skrifa::outline::{DrawSettings, OutlinePen};
+    use skrifa::{FontRef, MetadataProvider};
+    use zeno::{Command, Mask, Point};
+
+    struct ZenoPen(Vec<Command>);
+    impl OutlinePen for ZenoPen {
+        fn move_to(&mut self, x: f32, y: f32) { self.0.push(Command::MoveTo(Point::new(x, -y))); }
+        fn line_to(&mut self, x: f32, y: f32) { self.0.push(Command::LineTo(Point::new(x, -y))); }
+        fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+            self.0.push(Command::QuadTo(Point::new(cx, -cy), Point::new(x, -y)));
+        }
+        fn curve_to(&mut self, ax: f32, ay: f32, bx: f32, by: f32, x: f32, y: f32) {
+            self.0.push(Command::CurveTo(Point::new(ax, -ay), Point::new(bx, -by), Point::new(x, -y)));
+        }
+        fn close(&mut self) { self.0.push(Command::Close); }
+    }
+
+    let raw_font = include_bytes!("../assets/JetBrainsMono.ttf");
+    let skrifa_font = FontRef::new(raw_font).expect("skrifa: failed to parse font");
+    let skrifa_size = Size::new(64.0);
+    let skrifa_loc = LocationRef::default();
+    let skrifa_charmap = skrifa_font.charmap();
+    let skrifa_metrics = skrifa_font.glyph_metrics(skrifa_size, skrifa_loc);
+
+    // Compute the true rendered width of "hello world!"
+    let mut measured_width: f32 = 0.0;
+    for c in "hello world!".chars() {
+        if let Some(gid) = skrifa_charmap.map(c) {
+            if let Some(adv) = skrifa_metrics.advance_width(gid) {
+               measured_width += adv;
+            }
+        }
+    }
+    log::info!("skrifa: measured text width = {:.2}px", measured_width);
+
+    // Use zeno to rasterize the terminal cursor block (U+2588) as a validation glyph
+    let skrifa_outlines = skrifa_font.outline_glyphs();
+    if let Some(gid) = skrifa_charmap.map('\u{2588}') {
+        if let Some(outline) = skrifa_outlines.get(gid) {
+            let mut pen = ZenoPen::default();
+            outline.draw(DrawSettings::unhinted(skrifa_size, skrifa_loc), &mut pen).unwrap();
+            let (mask_data, placement) = Mask::new(&pen.0).render();
+            log::info!(
+                "zeno: cursor block rasterized -> {}x{} @ ({},{}), first pixel = {:?}",
+                placement.width, placement.height, placement.left, placement.top,
+                mask_data.first()
+            );
+        }
+    }
+
+    // --- Suzuri: high-level text layout & atlas generation ---
     let font_system = FontSystem::new();
-    font_system.load_font_binary(include_bytes!("../assets/JetBrainsMono.ttf").to_vec());
+    font_system.load_font_binary(raw_font.to_vec());
 
     let cache_configs = [GpuCacheConfig {
         texture_size: NonZeroUsize::new(1024).unwrap(),
@@ -175,17 +227,16 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }];
     font_system.gpu_init(&cache_configs);
 
-    // Query the font ID by family name
     let query = fontdb::Query {
         families: &[fontdb::Family::Name("JetBrains Mono")],
         ..Default::default()
     };
-    let (font_id, _) = font_system.query(&query).expect("Font not found");
+    let (font_id, _) = font_system.query(&query).expect("suzuri: font not found");
 
     let mut text_data = TextData::new();
     text_data.append(
         TextElement {
-            font_id: Some(font_id), // Use Option<ID> if required
+            font_id,
             font_size: 64.0,
             content: "hello world!".to_string(),
             user_data: (),
@@ -206,15 +257,14 @@ unsafe fn run_vulkan(window_ptr: usize) {
                     y: update.y,
                     width: update.width,
                     height: update.height,
-                    pixels: update.pixels.clone(), // FIX: field is `pixels`
+                    pixels: update.pixels.clone(),
                 });
             }
         },
         |instances| {
-            let text_width = 400.0;
-            let text_height = 64.0;
-            let offset_x = (width as f32 - text_width) / 2.0;
-            let offset_y = (height as f32 - text_height) / 2.0;
+            // Use skrifa's measured width for accurate centering
+            let offset_x = (width as f32 - measured_width) / 2.0;
+            let offset_y = (height as f32 - 64.0) / 2.0;
 
             for instance in instances {
                 let screen = instance.screen_rect;
@@ -225,13 +275,11 @@ unsafe fn run_vulkan(window_ptr: usize) {
                 let w = screen.width();
                 let h = screen.height();
 
-                let u0 = uv.min.x;
-                let v0 = uv.min.y;
-                let u1 = uv.max.x;
-                let v1 = uv.max.y;
+                let (u0, v0) = (uv.min.x, uv.min.y);
+                let (u1, v1) = (uv.max.x, uv.max.y);
 
-                let px0 = x; let py0 = y;
-                let px1 = x + w; let py1 = y + h;
+                let (px0, py0) = (x, y);
+                let (px1, py1) = (x + w, y + h);
 
                 vertices.extend_from_slice(&[
                     Vertex { pos: [px0, py0], uv: [u0, v0] },
@@ -246,7 +294,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         |_| {}
     );
 
-    log::info!("Generated {} vertices via suzuri", vertices.len());
+    log::info!("suzuri: generated {} vertices", vertices.len());
 
     // --- Texture Upload (Atlas) ---
     let atlas_size = 1024;
