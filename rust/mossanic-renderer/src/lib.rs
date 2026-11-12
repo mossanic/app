@@ -9,10 +9,16 @@ use ash::vk;
 use ash::Entry;
 use bytemuck::{Pod, Zeroable};
 
+// --- Font Stack ---
+use skrifa::instance::{LocationRef, Size};
+use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::{FontRef, MetadataProvider};
+use zeno::{Command, Mask, Point};
+
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
-// Compiled by naga at build time
+// Compiled by shaderc at build time
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
 
@@ -21,6 +27,34 @@ static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv
 struct Vertex {
     pos: [f32; 2],
     uv: [f32; 2],
+}
+
+// --- Zeno Outline Pen ---
+// Collects skrifa's y-up outline into zeno's y-down commands
+#[derive(Default)]
+struct ZenoPen(Vec<Command>);
+
+impl OutlinePen for ZenoPen {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.0.push(Command::MoveTo(Point::new(x, -y)));
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.0.push(Command::LineTo(Point::new(x, -y)));
+    }
+    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        self.0
+            .push(Command::QuadTo(Point::new(cx, -cy), Point::new(x, -y)));
+    }
+    fn curve_to(&mut self, ax: f32, ay: f32, bx: f32, by: f32, x: f32, y: f32) {
+        self.0.push(Command::CurveTo(
+            Point::new(ax, -ay),
+            Point::new(bx, -by),
+            Point::new(x, -y),
+        ));
+    }
+    fn close(&mut self) {
+        self.0.push(Command::Close);
+    }
 }
 
 #[no_mangle]
@@ -164,30 +198,34 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }
     log::info!("Framebuffers created");
 
-    // --- Font Rasterization (ab_glyph) ---
-    use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
-
+    // --- Font Rasterization (skrifa + zeno) ---
     let font_data = include_bytes!("../assets/JetBrainsMono.ttf");
-    let font = FontRef::try_from_slice(font_data).expect("Failed to parse font");
-    let scale = PxScale::from(64.0);
-    let scaled_font = font.as_scaled(scale);
+    let font = FontRef::new(font_data).expect("Failed to parse font");
+    let size = Size::new(64.0);
+    let loc = LocationRef::default();
+    let charmap = font.charmap();
+    let glyph_metrics = font.glyph_metrics(size, loc);
+    let outlines = font.outline_glyphs();
 
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
     let text = "hello world!";
 
     // Pass 1: Calculate total width
-    let mut total_width: f32 = 0.0;
+    let mut total_width = 0.0;
     for c in text.chars() {
-        let glyph_id = scaled_font.glyph_id(c);
-        total_width += scaled_font.h_advance(glyph_id) + 2.0;
+        if let Some(gid) = charmap.map(c) {
+            if let Some(advance) = glyph_metrics.advance_width(gid) {
+                total_width += advance + 2.0;
+            }
+        }
     }
 
     // Center on screen
-    let start_x = (width as f32 - total_width) / 2.0;
-    let ascent = scaled_font.ascent();
-    let descent = scaled_font.descent();
+    let ascent = font.metrics(size, loc).ascent;
+    let descent = font.metrics(size, loc).descent;
     let visual_height = ascent - descent;
+    let start_x = (width as f32 - total_width) / 2.0;
     let baseline_y = (height as f32 - visual_height) / 2.0 + ascent;
 
     let mut x_cursor = start_x;
@@ -195,56 +233,55 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     // Pass 2: Rasterize and generate vertices
     for c in text.chars() {
-        let glyph_id = scaled_font.glyph_id(c);
-        let advance = scaled_font.h_advance(glyph_id);
+        if let Some(gid) = charmap.map(c) {
+            let advance = glyph_metrics.advance_width(gid).unwrap_or(0.0);
 
-        let glyph = glyph_id.with_scale_and_position(scale, point(x_cursor, baseline_y));
+            if let Some(outline_glyph) = outlines.get(gid) {
+                let mut pen = ZenoPen::default();
+                let settings = DrawSettings::unhinted(size, loc);
+                outline_glyph.draw(settings, &mut pen).unwrap();
 
-        if let Some(outlined) = font.outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            let w = bounds.width() as usize;
-            let h = bounds.height() as usize;
+                let mask = Mask::new(&pen.0);
+                let placement = mask.placement();
 
-            if w > 0 && h > 0 {
-                let atlas_y = 0usize;
+                let w = placement.width as usize;
+                let h = placement.height as usize;
 
-                // Copy pixels to atlas
-                outlined.draw(|x, y, v| {
-                    let alpha = (v * 255.0) as u8;
-                    let px = atlas_x + x as usize;
-                    let py = atlas_y + y as usize;
-                    if px < 512 && py < 512 {
-                        atlas_data[py * 512 + px] = alpha;
+                if w > 0 && h > 0 {
+                    // Copy coverage mask to atlas
+                    for y in 0..h {
+                        for x in 0..w {
+                            atlas_data[y * 512 + (atlas_x + x)] = mask[y * w + x];
+                        }
                     }
-                });
 
-                // Generate quad vertices
-                let u0 = atlas_x as f32 / 512.0;
-                let v0 = atlas_y as f32 / 512.0;
-                let u1 = (atlas_x + w) as f32 / 512.0;
-                let v1 = (atlas_y + h) as f32 / 512.0;
+                    // Generate quad vertices
+                    let u0 = atlas_x as f32 / 512.0;
+                    let v0 = 0.0;
+                    let u1 = (atlas_x + w) as f32 / 512.0;
+                    let v1 = h as f32 / 512.0;
 
-                let px0 = bounds.min.x;
-                let py0 = bounds.min.y;
-                let px1 = bounds.max.x;
-                let py1 = bounds.max.y;
+                    let px0 = x_cursor + placement.left as f32;
+                    let py0 = baseline_y - placement.top as f32;
+                    let px1 = px0 + w as f32;
+                    let py1 = py0 + h as f32;
 
-                vertices.extend_from_slice(&[
-                    Vertex { pos: [px0, py0], uv: [u0, v0] },
-                    Vertex { pos: [px1, py0], uv: [u1, v0] },
-                    Vertex { pos: [px0, py1], uv: [u0, v1] },
-                    Vertex { pos: [px1, py0], uv: [u1, v0] },
-                    Vertex { pos: [px1, py1], uv: [u1, v1] },
-                    Vertex { pos: [px0, py1], uv: [u0, v1] },
-                ]);
+                    vertices.extend_from_slice(&[
+                        Vertex { pos: [px0, py0], uv: [u0, v0] },
+                        Vertex { pos: [px1, py0], uv: [u1, v0] },
+                        Vertex { pos: [px0, py1], uv: [u0, v1] },
+                        Vertex { pos: [px1, py0], uv: [u1, v0] },
+                        Vertex { pos: [px1, py1], uv: [u1, v1] },
+                        Vertex { pos: [px0, py1], uv: [u0, v1] },
+                    ]);
 
-                atlas_x += w + 2;
+                    atlas_x += w + 2;
+                }
             }
+            x_cursor += advance + 2.0;
         }
-
-        x_cursor += advance + 2.0;
     }
-    log::info!("Generated {} vertices via ab_glyph", vertices.len());
+    log::info!("Generated {} vertices via skrifa+zeno", vertices.len());
 
     // --- Texture Setup ---
     let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
@@ -337,7 +374,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let img_desc = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
     device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &img_desc, ..Default::default() }], &[]);
 
-    // --- Shaders (from naga) ---
+    // --- Shaders (from shaderc) ---
     let mut vert_words = vec![0u32; (VERT_SPV.len() + 3) / 4];
     let mut frag_words = vec![0u32; (FRAG_SPV.len() + 3) / 4];
     std::ptr::copy_nonoverlapping(VERT_SPV.as_ptr(), vert_words.as_mut_ptr() as *mut u8, VERT_SPV.len());
@@ -394,7 +431,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let push_constants = [width as f32, height as f32];
     let push_constants_bytes = std::slice::from_raw_parts(push_constants.as_ptr() as *const u8, 8);
 
-    log::info!("Entering render loop (ab_glyph).");
+    log::info!("Entering render loop (skrifa+zeno).");
 
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
