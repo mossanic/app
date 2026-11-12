@@ -122,14 +122,12 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let mut width = caps.current_extent.width;
     let mut height = caps.current_extent.height;
     if width == u32::MAX || width == 0 {
-        // Wrap in ManuallyDrop so the native window refcount isn't decremented when this goes out of scope
         let window = std::mem::ManuallyDrop::new(ndk::native_window::NativeWindow::from_ptr(
             std::ptr::NonNull::new_unchecked(window_ptr as *mut _)
         ));
         width = window.width() as u32;
         height = window.height() as u32;
     }
-
     log::info!("Extent: {}x{}", width, height);
 
     let swapchain_create_info = vk::SwapchainCreateInfoKHR {
@@ -144,7 +142,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
     let swapchain = swapchain_loader.create_swapchain(&swapchain_create_info, None).unwrap();
     let images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
-    
     log::info!("Swapchain created");
 
     let attachments = [vk::AttachmentDescription {
@@ -164,17 +161,16 @@ unsafe fn run_vulkan(window_ptr: usize) {
         let view = device.create_image_view(&vk::ImageViewCreateInfo { image: *image, view_type: vk::ImageViewType::TYPE_2D, format: format.format, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() }, None).unwrap();
         framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width, height, layers: 1, ..Default::default() }, None).unwrap());
     }
-    
     log::info!("Framebuffers created");
 
-    // --- Font Rasterization ---
+    // --- Font Rasterization (Fixed swash config) ---
     let font_data = include_bytes!("../assets/JetBrainsMono.ttf");
     let font = swash::FontRef::from_index(font_data, 0).unwrap();
     let mut context = swash::scale::ScaleContext::new();
-    let mut scaler = context.builder(font).size(64.0).build();
     
+    // FIX: Force hinting and remove explicit format
+    let mut scaler = context.builder(font).size(64.0).hint(true).build();
     let mut render = swash::scale::Render::new(&[]);
-    render.format(swash::zeno::Format::Alpha);
 
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
@@ -217,7 +213,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
             }
         }
     }
-    
     log::info!("Generated {} vertices", vertices.len());
 
     let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
@@ -308,7 +303,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let descriptor_sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo { descriptor_pool, descriptor_set_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() }).unwrap();
     let image_info = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
     device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &image_info, ..Default::default() }], &[]);
-    
     log::info!("Descriptors created");
 
     let mut vert_words = vec![0u32; (VERT_SPV.len() + 3) / 4];
@@ -318,28 +312,23 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: vert_words.len() * 4, p_code: vert_words.as_ptr(), ..Default::default() }, None).unwrap();
     let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: frag_words.len() * 4, p_code: frag_words.as_ptr(), ..Default::default() }, None).unwrap();
-    
     log::info!("Shaders created");
 
+    // FIX: Bind CString to a variable so the pointer remains valid
+    let main_name = CString::new("main").unwrap();
     let stages = [
-        vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::VERTEX, module: vert_module, p_name: CString::new("main").unwrap().as_ptr(), ..Default::default() },
-        vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::FRAGMENT, module: frag_module, p_name: CString::new("main").unwrap().as_ptr(), ..Default::default() },
+        vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::VERTEX, module: vert_module, p_name: main_name.as_ptr(), ..Default::default() },
+        vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::FRAGMENT, module: frag_module, p_name: main_name.as_ptr(), ..Default::default() },
     ];
     let binding_desc = [vk::VertexInputBindingDescription { binding: 0, stride: std::mem::size_of::<Vertex>() as u32, input_rate: vk::VertexInputRate::VERTEX }];
     let attr_desc = [
         vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 0 },
         vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 8 },
     ];
-   let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
     
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo { set_layout_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() };
-    
-    log::info!("Creating Pipeline Layout...")
-;
-    let pipeline_layout = match device.create_pipeline_layout(&pipeline_layout_info, None) {
-        Ok(pl) => pl,
-        Err(e) => { log::error!("FATAL: Failed to create pipeline layout: {:?}", e); return; }
-    };
+    let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None).unwrap();
 
     let viewport = [vk::Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 }];
     let scissor = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } }];
@@ -355,18 +344,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
         layout: pipeline_layout, render_pass, subpass: 0, ..Default::default()
     };
     
-    log::info!("Creating Graphics Pipeline...");
-    
     let pipeline = match device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None) {
-        Ok(pipelines) => {
-            if pipelines.is_empty() {
-                
-                log::error!("FATAL: Graphics pipeline array is empty!");
-                
-                return;
-            }
-            pipelines[0]
-        },
+        Ok(pipelines) => pipelines[0],
         Err((_, err)) => {
             log::error!("FATAL: Failed to create graphics pipeline: {:?}", err);
             return;
