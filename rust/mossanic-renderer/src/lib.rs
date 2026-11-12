@@ -170,6 +170,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     use skrifa::{FontRef, MetadataProvider};
     use zeno::{Command, Mask, Point};
 
+    #[derive(Default)]
     struct ZenoPen(Vec<Command>);
     impl OutlinePen for ZenoPen {
         fn move_to(&mut self, x: f32, y: f32) { self.0.push(Command::MoveTo(Point::new(x, -y))); }
