@@ -175,8 +175,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let text = "hello world!";
 
     // Pass 1: Calculate total width and max height for centering
-    let mut total_width = 0.0;
-    let mut max_height = 0.0;
+    let mut total_width: f32 = 0.0;
+    let mut max_height: f32 = 0.0;
     for c in text.chars() {
         let glyph_id = font.charmap().map(c);
         if let Some(image) = render.render(&mut scaler, glyph_id) {
