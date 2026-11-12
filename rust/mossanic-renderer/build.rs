@@ -10,7 +10,6 @@ fn main() {
     let compiler = shaderc::Compiler::new().expect("Failed to create shaderc compiler");
     let mut options = shaderc::CompileOptions::new().unwrap();
 
-    // Target Vulkan 1.1
     options.set_target_env(
         shaderc::TargetEnv::Vulkan,
         shaderc::EnvVersion::Vulkan1_1 as u32,
