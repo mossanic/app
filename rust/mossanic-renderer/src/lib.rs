@@ -163,12 +163,10 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }
     log::info!("Framebuffers created");
 
-    // --- Font Rasterization (Fixed swash config) ---
+    // --- Font Rasterization ---
     let font_data = include_bytes!("../assets/JetBrainsMono.ttf");
     let font = swash::FontRef::from_index(font_data, 0).unwrap();
     let mut context = swash::scale::ScaleContext::new();
-    
-    // FIX: Add normalize(true) and explicitly request Source::Outline
     let mut scaler = context.builder(font).size(64.0).hint(true).build();
     let mut render = swash::scale::Render::new(&[swash::scale::Source::Outline]);
 
@@ -176,46 +174,61 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let mut vertices = Vec::new();
     let text = "hello world!";
 
-    for (i, c) in text.chars().enumerate() {
+    // Pass 1: Calculate total width and max height for centering
+    let mut total_width = 0.0;
+    let mut max_height = 0.0;
+    for c in text.chars() {
         let glyph_id = font.charmap().map(c);
-        log::info!("Char: '{}', GlyphID: {:?}", c, glyph_id);
-        
-        match render.render(&mut scaler, glyph_id) {
-            Some(image) => {
-                let w = image.placement.width as usize;
-                let h = image.placement.height as usize;
-                log::info!("  -> Size: {}x{}", w, h);
-                if w == 0 || h == 0 { continue; }
-
-                let atlas_x = i * 64;
-                let atlas_y = 0;
-                for y in 0..h {
-                    for x in 0..w {
-                        atlas_data[(atlas_y + y) * 512 + (atlas_x + x)] = image.data[y * w + x];
-                    }
-                }
-                
-                let u0 = atlas_x as f32 / 512.0; let v0 = atlas_y as f32 / 512.0;
-                let u1 = (atlas_x + w) as f32 / 512.0; let v1 = (atlas_y + h) as f32 / 512.0;
-                
-                let x0 = -0.8 + (i as f32 * 0.1);
-                let y0 = -0.1;
-                let x1 = x0 + 0.08;
-                let y1 = y0 + 0.2;
-                
-                vertices.extend_from_slice(&[
-                    Vertex { pos: [x0, y0], uv: [u0, v0] }, Vertex { pos: [x1, y0], uv: [u1, v0] }, Vertex { pos: [x0, y1], uv: [u0, v1] },
-                    Vertex { pos: [x1, y0], uv: [u1, v0] }, Vertex { pos: [x1, y1], uv: [u1, v1] }, Vertex { pos: [x0, y1], uv: [u0, v1] },
-                ]);
-            }
-            None => {
-                if c != ' ' {
-                    log::error!("  -> Failed to render glyph");
-                }
-            }
+        if let Some(image) = render.render(&mut scaler, glyph_id) {
+            total_width += image.placement.width as f32 + 2.0; // 2px spacing
+            max_height = max_height.max(image.placement.height as f32);
         }
     }
-    log::info!("Generated {} vertices", vertices.len());
+
+    // Calculate center start position based on pixel resolution
+    let start_x = (width as f32 - total_width) / 2.0;
+    let start_y = (height as f32 - max_height) / 2.0;
+
+    let mut x_cursor = start_x;
+    let mut y_cursor = start_y;
+    let mut atlas_x = 0;
+
+    // Pass 2: Generate pixel coordinates
+    for c in text.chars() {
+        let glyph_id = font.charmap().map(c);
+        if let Some(image) = render.render(&mut scaler, glyph_id) {
+            let w = image.placement.width as usize;
+            let h = image.placement.height as usize;
+        
+            if w == 0 || h == 0 { 
+                x_cursor += 2.0; // Skip space
+                continue; 
+            }
+
+            // Copy to atlas
+            for y in 0..h {
+                for x in 0..w {
+                    atlas_data[y * 512 + (atlas_x + x)] = image.data[y * w + x];
+                }
+            }
+        
+            let u0 = atlas_x as f32 / 512.0; let v0 = 0.0;
+            let u1 = (atlas_x + w) as f32 / 512.0; let v1 = h as f32 / 512.0;
+        
+            // Use actual pixel sizes, not NDC
+            let px0 = x_cursor; let py0 = y_cursor;
+            let px1 = x_cursor + w as f32; let py1 = y_cursor + h as f32;
+        
+            vertices.extend_from_slice(&[
+                Vertex { pos: [px0, py0], uv: [u0, v0] }, Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
+                Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px1, py1], uv: [u1, v1] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
+            ]);
+
+            x_cursor += w as f32 + 2.0;
+            atlas_x += w + 2;
+        }
+    }
+    log::info!("Generated {} vertices, centered at {}, {}", vertices.len(), start_x, start_y);
 
     let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
     let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
@@ -328,8 +341,18 @@ unsafe fn run_vulkan(window_ptr: usize) {
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
     
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo { set_layout_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() };
-    let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None).unwrap();
+    // Set up Push Constants for screen size (2 floats = 8 bytes)
+    let push_constant_range = vk::PushConstantRange {
+        stage_flags: vk::ShaderStageFlags::VERTEX,
+        offset: 0,
+        size: 8,
+    };
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo { 
+        set_layout_count: 1, p_set_layouts: &descriptor_layout,
+        push_constant_range_count: 1, p_push_constant_ranges: &push_constant_range,
+        ..Default::default()
+    };
+    let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None).unwrap();    
 
     let viewport = [vk::Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 }];
     let scissor = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } }];
@@ -360,6 +383,9 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     log::info!("Entering render loop (Dark Gray Screen).");
 
+    let push_constants = [width as f32, height as f32];
+    let push_constants_bytes = std::slice::from_raw_parts(push_constants.as_ptr() as *const u8, 8);
+
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
         device.reset_fences(&[fence]).unwrap();
@@ -378,8 +404,12 @@ unsafe fn run_vulkan(window_ptr: usize) {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[descriptor_sets[0]], &[]);
+    
+            // Push the screen size to the shader
+            device.cmd_push_constants(cmd, pipeline_layout, vk::ShaderStageFlags::VERTEX, 0, push_constants_bytes);
+    
             device.cmd_draw(cmd, vertices.len() as u32, 1, 0, 0);
-        }
+        }	
         
         device.cmd_end_render_pass(cmd);
         device.end_command_buffer(cmd).unwrap();
