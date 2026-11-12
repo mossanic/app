@@ -12,8 +12,9 @@ use bytemuck::{Pod, Zeroable};
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
-static VERT_SPV: &[u8] = include_bytes!("../shaders/text.vert.spv");
-static FRAG_SPV: &[u8] = include_bytes!("../shaders/text.frag.spv");
+// Compiled by naga at build time
+static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
+static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -52,13 +53,13 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
         std::mem::forget(window);
 
         SHOULD_CLOSE.store(false, Ordering::SeqCst);
-        
+
         thread::spawn(move || {
             let result = std::panic::catch_unwind(|| {
                 run_vulkan(window_ptr);
             });
-            if let Err(_) = result {
-                log::error!("VULKAN THREAD PANICKED! Check the logs above.");
+            if result.is_err() {
+                log::error!("VULKAN THREAD PANICKED!");
             }
         });
     }
@@ -118,7 +119,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let caps = surface_ext.get_physical_device_surface_capabilities(physical_device, surface).unwrap();
     let formats = surface_ext.get_physical_device_surface_formats(physical_device, surface).unwrap();
     let format = formats[0];
-    
+
     let mut width = caps.current_extent.width;
     let mut height = caps.current_extent.height;
     if width == u32::MAX || width == 0 {
@@ -163,73 +164,89 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }
     log::info!("Framebuffers created");
 
-    // --- Font Rasterization ---
+    // --- Font Rasterization (ab_glyph) ---
+    use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
+
     let font_data = include_bytes!("../assets/JetBrainsMono.ttf");
-    let font = swash::FontRef::from_index(font_data, 0).unwrap();
-    let mut context = swash::scale::ScaleContext::new();
-    let mut scaler = context.builder(font).size(64.0).hint(true).build();
-    let mut render = swash::scale::Render::new(&[swash::scale::Source::Outline]);
+    let font = FontRef::try_from_slice(font_data).expect("Failed to parse font");
+    let scale = PxScale::from(64.0);
+    let scaled_font = font.as_scaled(scale);
 
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
     let text = "hello world!";
 
-    // Pass 1: Calculate total width and max height for centering
+    // Pass 1: Calculate total width
     let mut total_width: f32 = 0.0;
-    let mut max_height: f32 = 0.0;
     for c in text.chars() {
-        let glyph_id = font.charmap().map(c);
-        if let Some(image) = render.render(&mut scaler, glyph_id) {
-            total_width += image.placement.width as f32 + 2.0; // 2px spacing
-            max_height = max_height.max(image.placement.height as f32);
-        }
+        let glyph_id = scaled_font.glyph_id(c);
+        total_width += scaled_font.h_advance(glyph_id) + 2.0;
     }
 
-    // Calculate center start position based on pixel resolution
+    // Center on screen
     let start_x = (width as f32 - total_width) / 2.0;
-    let start_y = (height as f32 - max_height) / 2.0;
+    let ascent = scaled_font.ascent();
+    let descent = scaled_font.descent();
+    let visual_height = ascent - descent;
+    let baseline_y = (height as f32 - visual_height) / 2.0 + ascent;
 
     let mut x_cursor = start_x;
-    let mut y_cursor = start_y;
-    let mut atlas_x = 0;
+    let mut atlas_x = 0usize;
 
-    // Pass 2: Generate pixel coordinates
+    // Pass 2: Rasterize and generate vertices
     for c in text.chars() {
-        let glyph_id = font.charmap().map(c);
-        if let Some(image) = render.render(&mut scaler, glyph_id) {
-            let w = image.placement.width as usize;
-            let h = image.placement.height as usize;
-        
-            if w == 0 || h == 0 { 
-                x_cursor += 2.0; // Skip space
-                continue; 
-            }
+        let glyph_id = scaled_font.glyph_id(c);
+        let advance = scaled_font.h_advance(glyph_id);
 
-            // Copy to atlas
-            for y in 0..h {
-                for x in 0..w {
-                    atlas_data[y * 512 + (atlas_x + x)] = image.data[y * w + x];
-                }
-            }
-        
-            let u0 = atlas_x as f32 / 512.0; let v0 = 0.0;
-            let u1 = (atlas_x + w) as f32 / 512.0; let v1 = h as f32 / 512.0;
-        
-            // Use actual pixel sizes, not NDC
-            let px0 = x_cursor; let py0 = y_cursor;
-            let px1 = x_cursor + w as f32; let py1 = y_cursor + h as f32;
-        
-            vertices.extend_from_slice(&[
-                Vertex { pos: [px0, py0], uv: [u0, v0] }, Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
-                Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px1, py1], uv: [u1, v1] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
-            ]);
+        let glyph = glyph_id.with_scale_and_position(scale, point(x_cursor, baseline_y));
 
-            x_cursor += w as f32 + 2.0;
-            atlas_x += w + 2;
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            let w = bounds.width() as usize;
+            let h = bounds.height() as usize;
+
+            if w > 0 && h > 0 {
+                let atlas_y = 0usize;
+
+                // Copy pixels to atlas
+                outlined.draw(|x, y, v| {
+                    let alpha = (v * 255.0) as u8;
+                    let px = atlas_x + x as usize;
+                    let py = atlas_y + y as usize;
+                    if px < 512 && py < 512 {
+                        atlas_data[py * 512 + px] = alpha;
+                    }
+                });
+
+                // Generate quad vertices
+                let u0 = atlas_x as f32 / 512.0;
+                let v0 = atlas_y as f32 / 512.0;
+                let u1 = (atlas_x + w) as f32 / 512.0;
+                let v1 = (atlas_y + h) as f32 / 512.0;
+
+                let px0 = bounds.min.x;
+                let py0 = bounds.min.y;
+                let px1 = bounds.max.x;
+                let py1 = bounds.max.y;
+
+                vertices.extend_from_slice(&[
+                    Vertex { pos: [px0, py0], uv: [u0, v0] },
+                    Vertex { pos: [px1, py0], uv: [u1, v0] },
+                    Vertex { pos: [px0, py1], uv: [u0, v1] },
+                    Vertex { pos: [px1, py0], uv: [u1, v0] },
+                    Vertex { pos: [px1, py1], uv: [u1, v1] },
+                    Vertex { pos: [px0, py1], uv: [u0, v1] },
+                ]);
+
+                atlas_x += w + 2;
+            }
         }
-    }
-    log::info!("Generated {} vertices, centered at {}, {}", vertices.len(), start_x, start_y);
 
+        x_cursor += advance + 2.0;
+    }
+    log::info!("Generated {} vertices via ab_glyph", vertices.len());
+
+    // --- Texture Setup ---
     let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
     let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
     device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
@@ -282,6 +299,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let texture_view = device.create_image_view(&view_info, None).unwrap();
     let sampler = device.create_sampler(&vk::SamplerCreateInfo { mag_filter: vk::Filter::LINEAR, min_filter: vk::Filter::LINEAR, ..Default::default() }, None).unwrap();
 
+    // --- Vertex Buffer Setup ---
     let vbuf_size = if vertices.is_empty() { std::mem::size_of::<Vertex>() as u64 } else { (vertices.len() * std::mem::size_of::<Vertex>()) as u64 };
     let vbuf_info = vk::BufferCreateInfo { size: vbuf_size, usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
     let vertex_buffer = device.create_buffer(&vbuf_info, None).unwrap();
@@ -296,14 +314,13 @@ unsafe fn run_vulkan(window_ptr: usize) {
         let v_stage_reqs = device.get_buffer_memory_requirements(v_stage_buf);
         let v_stage_mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: v_stage_reqs.size, memory_type_index: staging_idx, ..Default::default() }, None).unwrap();
         device.bind_buffer_memory(v_stage_buf, v_stage_mem, 0).unwrap();
-        
+
         let v_ptr = device.map_memory(v_stage_mem, 0, vbuf_info.size, vk::MemoryMapFlags::empty()).unwrap();
         std::ptr::copy_nonoverlapping(vertices.as_ptr(), v_ptr as *mut Vertex, vertices.len());
         device.unmap_memory(v_stage_mem);
 
         device.cmd_copy_buffer(cmd, v_stage_buf, vertex_buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: vbuf_info.size }]);
     }
-    
     device.end_command_buffer(cmd).unwrap();
 
     let upload_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
@@ -311,15 +328,16 @@ unsafe fn run_vulkan(window_ptr: usize) {
     device.wait_for_fences(&[upload_fence], true, u64::MAX).unwrap();
     device.destroy_fence(upload_fence, None);
 
+    // --- Descriptors ---
     let pool_info = vk::DescriptorPoolCreateInfo { max_sets: 1, pool_size_count: 1, p_pool_sizes: &vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 }, ..Default::default() };
     let descriptor_pool = device.create_descriptor_pool(&pool_info, None).unwrap();
     let layout_binding = vk::DescriptorSetLayoutBinding { binding: 0, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1, stage_flags: vk::ShaderStageFlags::FRAGMENT, ..Default::default() };
     let descriptor_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo { binding_count: 1, p_bindings: &layout_binding, ..Default::default() }, None).unwrap();
     let descriptor_sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo { descriptor_pool, descriptor_set_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() }).unwrap();
-    let image_info = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
-    device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &image_info, ..Default::default() }], &[]);
-    log::info!("Descriptors created");
+    let img_desc = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
+    device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &img_desc, ..Default::default() }], &[]);
 
+    // --- Shaders (from naga) ---
     let mut vert_words = vec![0u32; (VERT_SPV.len() + 3) / 4];
     let mut frag_words = vec![0u32; (FRAG_SPV.len() + 3) / 4];
     std::ptr::copy_nonoverlapping(VERT_SPV.as_ptr(), vert_words.as_mut_ptr() as *mut u8, VERT_SPV.len());
@@ -327,7 +345,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: vert_words.len() * 4, p_code: vert_words.as_ptr(), ..Default::default() }, None).unwrap();
     let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: frag_words.len() * 4, p_code: frag_words.as_ptr(), ..Default::default() }, None).unwrap();
-    log::info!("Shaders created");
 
     let main_name = CString::new("main").unwrap();
     let stages = [
@@ -340,24 +357,24 @@ unsafe fn run_vulkan(window_ptr: usize) {
         vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 8 },
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
-    
-    // Set up Push Constants for screen size (2 floats = 8 bytes)
+
+    // Push constants: screen_size (2 floats = 8 bytes)
     let push_constant_range = vk::PushConstantRange {
         stage_flags: vk::ShaderStageFlags::VERTEX,
         offset: 0,
         size: 8,
     };
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo { 
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
         set_layout_count: 1, p_set_layouts: &descriptor_layout,
         push_constant_range_count: 1, p_push_constant_ranges: &push_constant_range,
         ..Default::default()
     };
-    let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None).unwrap();    
+    let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None).unwrap();
 
     let viewport = [vk::Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 }];
     let scissor = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } }];
     let viewport_state = vk::PipelineViewportStateCreateInfo { viewport_count: 1, p_viewports: viewport.as_ptr(), scissor_count: 1, p_scissors: scissor.as_ptr(), ..Default::default() };
-    
+
     let pipeline_info = vk::GraphicsPipelineCreateInfo {
         stage_count: 2, p_stages: stages.as_ptr(), p_vertex_input_state: &vertex_input,
         p_viewport_state: &viewport_state,
@@ -367,61 +384,50 @@ unsafe fn run_vulkan(window_ptr: usize) {
         p_color_blend_state: &vk::PipelineColorBlendStateCreateInfo { attachment_count: 1, p_attachments: &vk::PipelineColorBlendAttachmentState { blend_enable: vk::TRUE, src_color_blend_factor: vk::BlendFactor::SRC_ALPHA, dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA, color_write_mask: vk::ColorComponentFlags::RGBA, ..Default::default() }, ..Default::default() },
         layout: pipeline_layout, render_pass, subpass: 0, ..Default::default()
     };
-    
-    let pipeline = match device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None) {
-        Ok(pipelines) => pipelines[0],
-        Err((_, err)) => {
-            log::error!("FATAL: Failed to create graphics pipeline: {:?}", err);
-            return;
-        }
-    };
+    let pipeline = device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None).unwrap()[0];
     log::info!("Graphics Pipeline created");
 
     let sem_avail = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let sem_finish = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let fence = device.create_fence(&vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() }, None).unwrap();
 
-    log::info!("Entering render loop (Dark Gray Screen).");
-
     let push_constants = [width as f32, height as f32];
     let push_constants_bytes = std::slice::from_raw_parts(push_constants.as_ptr() as *const u8, 8);
+
+    log::info!("Entering render loop (ab_glyph).");
 
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
         device.reset_fences(&[fence]).unwrap();
-        
-        let acquire_result = swapchain_loader.acquire_next_image(swapchain, u64::MAX, sem_avail, vk::Fence::null());
-        if acquire_result.is_err() { break; }
-        let (idx, _) = acquire_result.unwrap();
+
+        let acquire = swapchain_loader.acquire_next_image(swapchain, u64::MAX, sem_avail, vk::Fence::null());
+        if acquire.is_err() { break; }
+        let (idx, _) = acquire.unwrap();
 
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
-        
+
         let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.1, 1.0] } }];
         device.cmd_begin_render_pass(cmd, &vk::RenderPassBeginInfo { render_pass, framebuffer: framebuffers[idx as usize], render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } }, clear_value_count: 1, p_clear_values: clear.as_ptr(), ..Default::default() }, vk::SubpassContents::INLINE);
-        
+
         if !vertices.is_empty() {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[descriptor_sets[0]], &[]);
-    
-            // Push the screen size to the shader
             device.cmd_push_constants(cmd, pipeline_layout, vk::ShaderStageFlags::VERTEX, 0, push_constants_bytes);
-    
             device.cmd_draw(cmd, vertices.len() as u32, 1, 0, 0);
-        }	
-        
+        }
+
         device.cmd_end_render_pass(cmd);
         device.end_command_buffer(cmd).unwrap();
 
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let submit_result = device.queue_submit(queue, &[vk::SubmitInfo { wait_semaphore_count: 1, p_wait_semaphores: &sem_avail, p_wait_dst_stage_mask: wait_stages.as_ptr(), command_buffer_count: 1, p_command_buffers: &cmd, signal_semaphore_count: 1, p_signal_semaphores: &sem_finish, ..Default::default() }], fence);
-        if submit_result.is_err() { break; }
-        
-        let present_result = swapchain_loader.queue_present(queue, &vk::PresentInfoKHR { wait_semaphore_count: 1, p_wait_semaphores: &sem_finish, swapchain_count: 1, p_swapchains: &swapchain, p_image_indices: &(idx as u32), ..Default::default() });
-        if present_result.is_err() { break; }
+        let submit = device.queue_submit(queue, &[vk::SubmitInfo { wait_semaphore_count: 1, p_wait_semaphores: &sem_avail, p_wait_dst_stage_mask: wait_stages.as_ptr(), command_buffer_count: 1, p_command_buffers: &cmd, signal_semaphore_count: 1, p_signal_semaphores: &sem_finish, ..Default::default() }], fence);
+        if submit.is_err() { break; }
+
+        let present = swapchain_loader.queue_present(queue, &vk::PresentInfoKHR { wait_semaphore_count: 1, p_wait_semaphores: &sem_finish, swapchain_count: 1, p_swapchains: &swapchain, p_image_indices: &(idx as u32), ..Default::default() });
+        if present.is_err() { break; }
     }
 
-    // FIX: Don't panic if the surface was destroyed while shutting down
     let _ = device.device_wait_idle();
 }
