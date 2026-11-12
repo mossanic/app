@@ -1,4 +1,4 @@
-use jni::objects::{JClass, JObject};
+wuse jni::objects::{JClass, JObject};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -244,7 +244,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         }
     );
     let layout = font_system.layout_text(&text_data, &TextLayoutConfig {
-        max_height: Some(f32::INFINITY),
+        max_width: Some(f32::INFINITY),
         max_height: Some(f32::INFINITY),
         ..Default::default()
     });
