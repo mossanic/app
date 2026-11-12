@@ -5,15 +5,22 @@ use std::sync::Mutex;
 use std::ffi::CString;
 use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::num::NonZeroUsize;
 use ash::vk;
 use ash::Entry;
 use bytemuck::{Pod, Zeroable};
 
-// --- Font Stack ---
-use skrifa::instance::{LocationRef, Size};
-use skrifa::outline::{DrawSettings, OutlinePen};
-use skrifa::{FontRef, MetadataProvider};
-use zeno::{Command, Mask, Point};
+// --- Windowing Abstraction ---
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use android_raw_window::AndroidNativeWindow;
+
+// --- Suzuri Text Rendering ---
+use suzuri::{
+    FontSystem, 
+    fontdb,
+    renderer::{GpuCacheConfig, AtlasUpdate, GlyphInstance}, 
+    text::{TextData, TextElement, TextLayoutConfig, Attrs}
+};
 
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
@@ -27,34 +34,6 @@ static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv
 struct Vertex {
     pos: [f32; 2],
     uv: [f32; 2],
-}
-
-// --- Zeno Outline Pen ---
-// Collects skrifa's y-up outline into zeno's y-down commands
-#[derive(Default)]
-struct ZenoPen(Vec<Command>);
-
-impl OutlinePen for ZenoPen {
-    fn move_to(&mut self, x: f32, y: f32) {
-        self.0.push(Command::MoveTo(Point::new(x, -y)));
-    }
-    fn line_to(&mut self, x: f32, y: f32) {
-        self.0.push(Command::LineTo(Point::new(x, -y)));
-    }
-    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
-        self.0
-            .push(Command::QuadTo(Point::new(cx, -cy), Point::new(x, -y)));
-    }
-    fn curve_to(&mut self, ax: f32, ay: f32, bx: f32, by: f32, x: f32, y: f32) {
-        self.0.push(Command::CurveTo(
-            Point::new(ax, -ay),
-            Point::new(bx, -by),
-            Point::new(x, -y),
-        ));
-    }
-    fn close(&mut self) {
-        self.0.push(Command::Close);
-    }
 }
 
 #[no_mangle]
@@ -73,18 +52,19 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
     *init_guard = true;
 
     unsafe {
-        let window = match ndk::native_window::NativeWindow::from_surface(
+        let window_ptr = match ndk::native_window::NativeWindow::from_surface(
             env.get_native_interface() as *mut _, surface.as_raw() as *mut _
         ) {
-            Some(w) => w,
+            Some(w) => w.ptr().as_ptr() as usize,
             None => {
                 log::error!("Failed to create ANativeWindow");
                 *init_guard = false;
                 return 0;
             }
         };
-        let window_ptr = window.ptr().as_ptr() as usize;
-        std::mem::forget(window);
+        
+        // We leak the window reference so it lives for the duration of the thread
+        std::mem::forget(surface);
 
         SHOULD_CLOSE.store(false, Ordering::SeqCst);
 
@@ -113,6 +93,13 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_resize(_env: JNIEnv, _
 unsafe fn run_vulkan(window_ptr: usize) {
     log::info!("Starting Vulkan initialization...");
     let entry = Entry::load().expect("Failed to load Vulkan");
+
+    // --- 1. Unified Window Handle ---
+    let native_window = AndroidNativeWindow(window_ptr as *mut _);
+    let window_handle = native_window.window_handle().unwrap();
+    let display_handle = native_window.display_handle().unwrap();
+
+    // --- 2. Vulkan Instance ---
     let app_name = CString::new("MossanicSpike").unwrap();
     let app_info = vk::ApplicationInfo {
         p_application_name: app_name.as_ptr(),
@@ -120,7 +107,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         ..Default::default()
     };
 
-    let instance_exts = [ash::khr::surface::NAME.as_ptr(), ash::khr::android_surface::NAME.as_ptr()];
+    let instance_exts = ash_window::enumerate_required_extensions(display_handle).unwrap();
     let instance_create_info = vk::InstanceCreateInfo {
         p_application_info: &app_info,
         enabled_extension_count: instance_exts.len() as u32,
@@ -129,14 +116,14 @@ unsafe fn run_vulkan(window_ptr: usize) {
     };
     let instance = entry.create_instance(&instance_create_info, None).unwrap();
 
-    let android_surface = ash::khr::android_surface::Instance::new(&entry, &instance);
-    let surface_create_info = vk::AndroidSurfaceCreateInfoKHR { window: window_ptr as *mut _, ..Default::default() };
-    let surface = android_surface.create_android_surface(&surface_create_info, None).unwrap();
+    // --- 3. Create Surface via ash-window ---
+    let surface = ash_window::create_surface(&entry, &instance, display_handle, window_handle, None)
+        .expect("Failed to create Vulkan surface from raw-window-handle");
     let surface_ext = ash::khr::surface::Instance::new(&entry, &instance);
 
+    // --- 4. Device & Swapchain Setup ---
     let physical_device = instance.enumerate_physical_devices().unwrap()[0];
     let device_exts = [ash::khr::swapchain::NAME.as_ptr()];
-
     let queue_priorities = [1.0];
     let queue_create_info = vk::DeviceQueueCreateInfo {
         queue_family_index: 0, queue_count: 1, p_queue_priorities: queue_priorities.as_ptr(), ..Default::default()
@@ -153,15 +140,12 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let caps = surface_ext.get_physical_device_surface_capabilities(physical_device, surface).unwrap();
     let formats = surface_ext.get_physical_device_surface_formats(physical_device, surface).unwrap();
     let format = formats[0];
-
+    
     let mut width = caps.current_extent.width;
     let mut height = caps.current_extent.height;
     if width == u32::MAX || width == 0 {
-        let window = std::mem::ManuallyDrop::new(ndk::native_window::NativeWindow::from_ptr(
-            std::ptr::NonNull::new_unchecked(window_ptr as *mut _)
-        ));
-        width = window.width() as u32;
-        height = window.height() as u32;
+        width = native_window.0.width() as u32;
+        height = native_window.0.height() as u32;
     }
     log::info!("Extent: {}x{}", width, height);
 
@@ -177,8 +161,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
     let swapchain = swapchain_loader.create_swapchain(&swapchain_create_info, None).unwrap();
     let images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
-    log::info!("Swapchain created");
 
+    // --- 5. Render Pass & Framebuffers ---
     let attachments = [vk::AttachmentDescription {
         format: format.format, samples: vk::SampleCountFlags::TYPE_1,
         load_op: vk::AttachmentLoadOp::CLEAR, store_op: vk::AttachmentStoreOp::STORE,
@@ -196,100 +180,79 @@ unsafe fn run_vulkan(window_ptr: usize) {
         let view = device.create_image_view(&vk::ImageViewCreateInfo { image: *image, view_type: vk::ImageViewType::TYPE_2D, format: format.format, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() }, None).unwrap();
         framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width, height, layers: 1, ..Default::default() }, None).unwrap());
     }
-    log::info!("Framebuffers created");
 
-    // --- Font Rasterization (skrifa + zeno) ---
-    let font_data = include_bytes!("../assets/JetBrainsMono.ttf");
-    let font = FontRef::new(font_data).expect("Failed to parse font");
-    let size = Size::new(64.0);
-    let loc = LocationRef::default();
-    let charmap = font.charmap();
-    let glyph_metrics = font.glyph_metrics(size, loc);
-    let outlines = font.outline_glyphs();
+    // --- 6. Suzuri Text Layout & Rasterization ---
+    let mut font_system = FontSystem::new();
+    font_system.db_mut().load_font_data(include_bytes!("../assets/JetBrainsMono.ttf").to_vec());
 
-    let mut atlas_data = vec![0u8; 512 * 512];
-    let mut vertices = Vec::new();
-    let text = "hello world!";
+    let cache_configs = [GpuCacheConfig {
+        texture_size: NonZeroUsize::new(1024).unwrap(),
+        tile_size: NonZeroUsize::new(32).unwrap(),
+        tiles_per_axis: NonZeroUsize::new(32).unwrap(),
+    }];
+    font_system.gpu_init(&cache_configs);
 
-    // Pass 1: Calculate total width
-    let mut total_width = 0.0;
-    for c in text.chars() {
-        if let Some(gid) = charmap.map(c) {
-            if let Some(advance) = glyph_metrics.advance_width(gid) {
-                total_width += advance + 2.0;
+    let mut text_data = TextData::new();
+    text_data.append(
+        TextElement::new(
+            "hello world!",
+            Attrs::new().family(fontdb::Family::Name("JetBrains Mono")),
+        )
+    );
+    let layout = font_system.layout_text(&text_data, &TextLayoutConfig::default());
+
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut atlas_updates: Vec<AtlasUpdate> = Vec::new();
+
+    // Extract geometry and texture data from Suzuri
+    font_system.gpu_render(
+        &layout,
+        |updates| {
+            for update in updates {
+                atlas_updates.push(update.clone());
             }
-        }
-    }
+        },
+        |instances| {
+            // Center the text manually
+            let text_width = 400.0; // Approximate width of "hello world!"
+            let text_height = 64.0;
+            let offset_x = (width as f32 - text_width) / 2.0;
+            let offset_y = (height as f32 - text_height) / 2.0;
 
-    // Center on screen
-    let ascent = font.metrics(size, loc).ascent;
-    let descent = font.metrics(size, loc).descent;
-    let visual_height = ascent - descent;
-    let start_x = (width as f32 - total_width) / 2.0;
-    let baseline_y = (height as f32 - visual_height) / 2.0 + ascent;
+            for instance in instances {
+                let x = instance.x + offset_x;
+                let y = instance.y + offset_y;
+                let w = instance.width;
+                let h = instance.height;
+                
+                let u0 = instance.uv_rect.min.x;
+                let v0 = instance.uv_rect.min.y;
+                let u1 = instance.uv_rect.max.x;
+                let v1 = instance.uv_rect.max.y;
 
-    let mut x_cursor = start_x;
-    let mut atlas_x = 0usize;
+                let px0 = x; let py0 = y;
+                let px1 = x + w; let py1 = y + h;
 
-    // Pass 2: Rasterize and generate vertices
-    for c in text.chars() {
-        if let Some(gid) = charmap.map(c) {
-            let advance = glyph_metrics.advance_width(gid).unwrap_or(0.0);
-
-            if let Some(outline_glyph) = outlines.get(gid) {
-                let mut pen = ZenoPen::default();
-                let settings = DrawSettings::unhinted(size, loc);
-                outline_glyph.draw(settings, &mut pen).unwrap();
-
-                // FIX: Use .render() to get the coverage bytes and Placement
-                let (mask_data, placement) = Mask::new(&pen.0).render();
-                let w = placement.width as usize;
-                let h = placement.height as usize;
-
-                if w > 0 && h > 0 {
-                    // Copy coverage mask to atlas
-                    for y in 0..h {
-                        for x in 0..w {
-                            atlas_data[y * 512 + (atlas_x + x)] = mask_data[y * w + x];
-                        }
-                    }
-
-                    // Generate quad vertices
-                    let u0 = atlas_x as f32 / 512.0;
-                    let v0 = 0.0;
-                    let u1 = (atlas_x + w) as f32 / 512.0;
-                    let v1 = h as f32 / 512.0;
-
-                    let px0 = x_cursor + placement.left as f32;
-                    let py0 = baseline_y - placement.top as f32;
-                    let px1 = px0 + w as f32;
-                    let py1 = py0 + h as f32;
-
-                    vertices.extend_from_slice(&[
-                        Vertex { pos: [px0, py0], uv: [u0, v0] },
-                        Vertex { pos: [px1, py0], uv: [u1, v0] },
-                        Vertex { pos: [px0, py1], uv: [u0, v1] },
-                        Vertex { pos: [px1, py0], uv: [u1, v0] },
-                        Vertex { pos: [px1, py1], uv: [u1, v1] },
-                        Vertex { pos: [px0, py1], uv: [u0, v1] },
-                    ]);
-
-                    atlas_x += w + 2;
-                }
+                vertices.extend_from_slice(&[
+                    Vertex { pos: [px0, py0], uv: [u0, v0] },
+                    Vertex { pos: [px1, py0], uv: [u1, v0] },
+                    Vertex { pos: [px0, py1], uv: [u0, v1] },
+                    Vertex { pos: [px1, py0], uv: [u1, v0] },
+                    Vertex { pos: [px1, py1], uv: [u1, v1] },
+                    Vertex { pos: [px0, py1], uv: [u0, v1] },
+                ]);
             }
-            x_cursor += advance + 2.0;
-        }
-    }    
+        },
+        |_| {} // Standalone glyphs (ignore for this spike)
+    );
 
-    log::info!("Generated {} vertices via skrifa+zeno", vertices.len());
+    log::info!("Generated {} vertices via suzuri", vertices.len());
 
-    // --- Texture Setup ---
-    let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
-    let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
-    device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
-
+    // --- 7. Upload Atlas Texture ---
+    let atlas_size = 1024;
     let image_info = vk::ImageCreateInfo {
-        image_type: vk::ImageType::TYPE_2D, format: vk::Format::R8_UNORM, extent: vk::Extent3D { width: 512, height: 512, depth: 1 },
+        image_type: vk::ImageType::TYPE_2D, format: vk::Format::R8_UNORM,
+        extent: vk::Extent3D { width: atlas_size, height: atlas_size, depth: 1 },
         mip_levels: 1, array_layers: 1, samples: vk::SampleCountFlags::TYPE_1, tiling: vk::ImageTiling::OPTIMAL,
         usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST, initial_layout: vk::ImageLayout::UNDEFINED, ..Default::default()
     };
@@ -299,44 +262,57 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let texture_memory = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: mem_reqs.size, memory_type_index: mem_type_index, ..Default::default() }, None).unwrap();
     device.bind_image_memory(texture_image, texture_memory, 0).unwrap();
 
-    let staging_info = vk::BufferCreateInfo { size: atlas_data.len() as u64, usage: vk::BufferUsageFlags::TRANSFER_SRC, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
-    let staging_buffer = device.create_buffer(&staging_info, None).unwrap();
-    let staging_reqs = device.get_buffer_memory_requirements(staging_buffer);
-    let staging_idx = (0..mem_props.memory_type_count).find(|&i| (staging_reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)).unwrap();
-    let staging_mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: staging_reqs.size, memory_type_index: staging_idx, ..Default::default() }, None).unwrap();
-    device.bind_buffer_memory(staging_buffer, staging_mem, 0).unwrap();
-    let ptr = device.map_memory(staging_mem, 0, atlas_data.len() as u64, vk::MemoryMapFlags::empty()).unwrap();
-    std::ptr::copy_nonoverlapping(atlas_data.as_ptr(), ptr as *mut u8, atlas_data.len());
-    device.unmap_memory(staging_mem);
+    let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
+    let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
+    device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
-    let barrier_to_transfer = vk::ImageMemoryBarrier {
+    // Transition for transfer
+    let barrier1 = vk::ImageMemoryBarrier {
         old_layout: vk::ImageLayout::UNDEFINED, new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         src_queue_family_index: vk::QUEUE_FAMILY_IGNORED, dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
         image: texture_image, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() },
         src_access_mask: vk::AccessFlags::empty(), dst_access_mask: vk::AccessFlags::TRANSFER_WRITE, ..Default::default()
     };
-    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier_to_transfer]);
+    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier1]);
 
-    let region = vk::BufferImageCopy {
-        buffer_offset: 0, buffer_row_length: 0, buffer_image_height: 0,
-        image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 }, image_extent: vk::Extent3D { width: 512, height: 512, depth: 1 }, ..Default::default()
-    };
-    device.cmd_copy_buffer_to_image(cmd, staging_buffer, texture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+    // Upload each atlas update (Suzuri gives us the exact regions to write)
+    for update in atlas_updates {
+        let staging_info = vk::BufferCreateInfo { size: update.data.len() as u64, usage: vk::BufferUsageFlags::TRANSFER_SRC, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
+        let staging_buffer = device.create_buffer(&staging_info, None).unwrap();
+        let reqs = device.get_buffer_memory_requirements(staging_buffer);
+        let idx = (0..mem_props.memory_type_count).find(|&i| (reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)).unwrap();
+        let mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: reqs.size, memory_type_index: idx, ..Default::default() }, None).unwrap();
+        device.bind_buffer_memory(staging_buffer, mem, 0).unwrap();
+        
+        let ptr = device.map_memory(mem, 0, update.data.len() as u64, vk::MemoryMapFlags::empty()).unwrap();
+        std::ptr::copy_nonoverlapping(update.data.as_ptr(), ptr as *mut u8, update.data.len());
+        device.unmap_memory(mem);
 
-    let barrier_to_shader = vk::ImageMemoryBarrier {
+        let region = vk::BufferImageCopy {
+            buffer_offset: 0, buffer_row_length: 0, buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+            image_offset: vk::Offset3D { x: update.x as i32, y: update.y as i32, z: 0 },
+            image_extent: vk::Extent3D { width: update.width as u32, height: update.height as u32, depth: 1 },
+            ..Default::default()
+        };
+        device.cmd_copy_buffer_to_image(cmd, staging_buffer, texture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+    }
+
+    // Transition for shader
+    let barrier2 = vk::ImageMemoryBarrier {
         old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL, new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         src_queue_family_index: vk::QUEUE_FAMILY_IGNORED, dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
         image: texture_image, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() },
         src_access_mask: vk::AccessFlags::TRANSFER_WRITE, dst_access_mask: vk::AccessFlags::SHADER_READ, ..Default::default()
     };
-    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &[barrier_to_shader]);
+    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &[barrier2]);
 
+    // Image View & Sampler
     let view_info = vk::ImageViewCreateInfo { image: texture_image, view_type: vk::ImageViewType::TYPE_2D, format: vk::Format::R8_UNORM, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() };
     let texture_view = device.create_image_view(&view_info, None).unwrap();
     let sampler = device.create_sampler(&vk::SamplerCreateInfo { mag_filter: vk::Filter::LINEAR, min_filter: vk::Filter::LINEAR, ..Default::default() }, None).unwrap();
 
-    // --- Vertex Buffer Setup ---
+    // --- 8. Vertex Buffer ---
     let vbuf_size = if vertices.is_empty() { std::mem::size_of::<Vertex>() as u64 } else { (vertices.len() * std::mem::size_of::<Vertex>()) as u64 };
     let vbuf_info = vk::BufferCreateInfo { size: vbuf_size, usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
     let vertex_buffer = device.create_buffer(&vbuf_info, None).unwrap();
@@ -349,6 +325,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         let v_stage_info = vk::BufferCreateInfo { size: vbuf_info.size, usage: vk::BufferUsageFlags::TRANSFER_SRC, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
         let v_stage_buf = device.create_buffer(&v_stage_info, None).unwrap();
         let v_stage_reqs = device.get_buffer_memory_requirements(v_stage_buf);
+        let staging_idx = (0..mem_props.memory_type_count).find(|&i| (v_stage_reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)).unwrap();
         let v_stage_mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: v_stage_reqs.size, memory_type_index: staging_idx, ..Default::default() }, None).unwrap();
         device.bind_buffer_memory(v_stage_buf, v_stage_mem, 0).unwrap();
 
@@ -365,7 +342,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     device.wait_for_fences(&[upload_fence], true, u64::MAX).unwrap();
     device.destroy_fence(upload_fence, None);
 
-    // --- Descriptors ---
+    // --- 9. Descriptors & Pipeline ---
     let pool_info = vk::DescriptorPoolCreateInfo { max_sets: 1, pool_size_count: 1, p_pool_sizes: &vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 }, ..Default::default() };
     let descriptor_pool = device.create_descriptor_pool(&pool_info, None).unwrap();
     let layout_binding = vk::DescriptorSetLayoutBinding { binding: 0, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1, stage_flags: vk::ShaderStageFlags::FRAGMENT, ..Default::default() };
@@ -374,14 +351,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let img_desc = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
     device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &img_desc, ..Default::default() }], &[]);
 
-    // --- Shaders (from shaderc) ---
-    let mut vert_words = vec![0u32; (VERT_SPV.len() + 3) / 4];
-    let mut frag_words = vec![0u32; (FRAG_SPV.len() + 3) / 4];
-    std::ptr::copy_nonoverlapping(VERT_SPV.as_ptr(), vert_words.as_mut_ptr() as *mut u8, VERT_SPV.len());
-    std::ptr::copy_nonoverlapping(FRAG_SPV.as_ptr(), frag_words.as_mut_ptr() as *mut u8, FRAG_SPV.len());
-
-    let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: vert_words.len() * 4, p_code: vert_words.as_ptr(), ..Default::default() }, None).unwrap();
-    let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: frag_words.len() * 4, p_code: frag_words.as_ptr(), ..Default::default() }, None).unwrap();
+    let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: VERT_SPV.len(), p_code: VERT_SPV.as_ptr() as *const u32, ..Default::default() }, None).unwrap();
+    let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: FRAG_SPV.len(), p_code: FRAG_SPV.as_ptr() as *const u32, ..Default::default() }, None).unwrap();
 
     let main_name = CString::new("main").unwrap();
     let stages = [
@@ -395,7 +366,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
 
-    // Push constants: screen_size (2 floats = 8 bytes)
     let push_constant_range = vk::PushConstantRange {
         stage_flags: vk::ShaderStageFlags::VERTEX,
         offset: 0,
@@ -422,8 +392,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
         layout: pipeline_layout, render_pass, subpass: 0, ..Default::default()
     };
     let pipeline = device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None).unwrap()[0];
-    log::info!("Graphics Pipeline created");
 
+    // --- 10. Render Loop ---
     let sem_avail = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let sem_finish = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let fence = device.create_fence(&vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() }, None).unwrap();
@@ -431,7 +401,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let push_constants = [width as f32, height as f32];
     let push_constants_bytes = std::slice::from_raw_parts(push_constants.as_ptr() as *const u8, 8);
 
-    log::info!("Entering render loop (skrifa+zeno).");
+    log::info!("Entering render loop.");
 
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
