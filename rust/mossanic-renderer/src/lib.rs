@@ -243,7 +243,11 @@ unsafe fn run_vulkan(window_ptr: usize) {
             user_data: (),
         }
     );
-    let layout = font_system.layout_text(&text_data, &TextLayoutConfig::default());
+    let layout = font_system.layout_text(&text_data, &TextLayoutConfig {
+        max_width: f32::INFINITY,
+        max_height: f32::INFINITY,
+        ..Default::default()
+    });
 
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut atlas_updates: Vec<AtlasUpdate> = Vec::new();
