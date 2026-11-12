@@ -29,4 +29,4 @@ fn main() {
         let dest_path = Path::new(&out_dir).join(dest_name);
         fs::write(dest_path, binary_result.as_binary_u8()).unwrap();
     }
-    }
+}
