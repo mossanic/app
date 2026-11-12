@@ -10,22 +10,19 @@ use ash::vk;
 use ash::Entry;
 use bytemuck::{Pod, Zeroable};
 
-// --- Windowing Abstraction ---
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use android_raw_window::AndroidNativeWindow;
 
-// --- Suzuri Text Rendering ---
 use suzuri::{
-    FontSystem, 
+    FontSystem,
     fontdb,
-    renderer::{GpuCacheConfig, AtlasUpdate, GlyphInstance}, 
-    text::{TextData, TextElement, TextLayoutConfig, Attrs}
+    renderer::{GpuCacheConfig, AtlasUpdate, GlyphInstance},
+    text::{TextData, TextElement, TextLayoutConfig, Attrs},
 };
 
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
-// Compiled by shaderc at build time
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
 
@@ -41,9 +38,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
     env: JNIEnv, _class: JClass, surface: JObject,
 ) -> jni::sys::jboolean {
     android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Trace)
-            .with_tag("MossanicRust"),
+        android_logger::Config::default().with_max_level(log::LevelFilter::Trace).with_tag("MossanicRust"),
     );
     log::info!("JNI: setSurfaceVulkan called");
 
@@ -56,15 +51,8 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
             env.get_native_interface() as *mut _, surface.as_raw() as *mut _
         ) {
             Some(w) => w.ptr().as_ptr() as usize,
-            None => {
-                log::error!("Failed to create ANativeWindow");
-                *init_guard = false;
-                return 0;
-            }
+            None => { log::error!("Failed to create ANativeWindow"); return 0; }
         };
-        
-        // We leak the window reference so it lives for the duration of the thread
-        std::mem::forget(surface);
 
         SHOULD_CLOSE.store(false, Ordering::SeqCst);
 
@@ -72,9 +60,7 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceVulkan(
             let result = std::panic::catch_unwind(|| {
                 run_vulkan(window_ptr);
             });
-            if result.is_err() {
-                log::error!("VULKAN THREAD PANICKED!");
-            }
+            if result.is_err() { log::error!("VULKAN THREAD PANICKED!"); }
         });
     }
     1
@@ -107,7 +93,11 @@ unsafe fn run_vulkan(window_ptr: usize) {
         ..Default::default()
     };
 
-    let instance_exts = ash_window::enumerate_required_extensions(display_handle).unwrap();
+    // FIX: ash-window expects RawDisplayHandle, not DisplayHandle
+    let raw_display_handle = display_handle.as_raw();
+    let raw_window_handle = window_handle.as_raw();
+
+    let instance_exts = ash_window::enumerate_required_extensions(raw_display_handle).unwrap();
     let instance_create_info = vk::InstanceCreateInfo {
         p_application_info: &app_info,
         enabled_extension_count: instance_exts.len() as u32,
@@ -117,7 +107,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let instance = entry.create_instance(&instance_create_info, None).unwrap();
 
     // --- 3. Create Surface via ash-window ---
-    let surface = ash_window::create_surface(&entry, &instance, display_handle, window_handle, None)
+    // FIX: Pass raw handles, not the wrapper types
+    let surface = ash_window::create_surface(&entry, &instance, raw_display_handle, raw_window_handle, None)
         .expect("Failed to create Vulkan surface from raw-window-handle");
     let surface_ext = ash::khr::surface::Instance::new(&entry, &instance);
 
@@ -144,8 +135,9 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let mut width = caps.current_extent.width;
     let mut height = caps.current_extent.height;
     if width == u32::MAX || width == 0 {
-        width = native_window.0.width() as u32;
-        height = native_window.0.height() as u32;
+        // FIX: Use the android-raw-window helper methods, not raw pointer methods
+        width = native_window.get_width();
+        height = native_window.get_height();
     }
     log::info!("Extent: {}x{}", width, height);
 
@@ -182,8 +174,10 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }
 
     // --- 6. Suzuri Text Layout & Rasterization ---
-    let mut font_system = FontSystem::new();
-    font_system.db_mut().load_font_data(include_bytes!("../assets/JetBrainsMono.ttf").to_vec());
+    let font_system = FontSystem::new();
+    
+    // FIX: Use load_font_data directly on FontSystem, not db_mut()
+    font_system.load_font_data(include_bytes!("../assets/JetBrainsMono.ttf").to_vec());
 
     let cache_configs = [GpuCacheConfig {
         texture_size: NonZeroUsize::new(1024).unwrap(),
@@ -193,11 +187,13 @@ unsafe fn run_vulkan(window_ptr: usize) {
     font_system.gpu_init(&cache_configs);
 
     let mut text_data = TextData::new();
+    // FIX: TextElement::new does not exist; use struct literal or default
     text_data.append(
-        TextElement::new(
-            "hello world!",
-            Attrs::new().family(fontdb::Family::Name("JetBrains Mono")),
-        )
+        TextElement {
+            text: "hello world!".to_string(),
+            attrs: Attrs::new().family(fontdb::Family::Name("JetBrains Mono")),
+            ..Default::default()
+        }
     );
     let layout = font_system.layout_text(&text_data, &TextLayoutConfig::default());
 
@@ -209,26 +205,38 @@ unsafe fn run_vulkan(window_ptr: usize) {
         &layout,
         |updates| {
             for update in updates {
-                atlas_updates.push(update.clone());
+                // FIX: AtlasUpdate is not Clone; we need to copy its data manually
+                // But since we need to own it for later upload, we clone the pixels vec
+                atlas_updates.push(AtlasUpdate {
+                    texture_index: update.texture_index,
+                    x: update.x,
+                    y: update.y,
+                    width: update.width,
+                    height: update.height,
+                    pixels: update.pixels.clone(), // FIX: field is `pixels`, not `data`
+                });
             }
         },
         |instances| {
-            // Center the text manually
-            let text_width = 400.0; // Approximate width of "hello world!"
+            let text_width = 400.0;
             let text_height = 64.0;
             let offset_x = (width as f32 - text_width) / 2.0;
             let offset_y = (height as f32 - text_height) / 2.0;
 
             for instance in instances {
-                let x = instance.x + offset_x;
-                let y = instance.y + offset_y;
-                let w = instance.width;
-                let h = instance.height;
-                
-                let u0 = instance.uv_rect.min.x;
-                let v0 = instance.uv_rect.min.y;
-                let u1 = instance.uv_rect.max.x;
-                let v1 = instance.uv_rect.max.y;
+                // FIX: GlyphInstance uses screen_rect and uv_rect (Box2D), not x/y/width/height
+                let screen = instance.screen_rect;
+                let uv = instance.uv_rect;
+
+                let x = screen.min.x + offset_x;
+                let y = screen.min.y + offset_y;
+                let w = screen.width();
+                let h = screen.height();
+
+                let u0 = uv.min.x;
+                let v0 = uv.min.y;
+                let u1 = uv.max.x;
+                let v1 = uv.max.y;
 
                 let px0 = x; let py0 = y;
                 let px1 = x + w; let py1 = y + h;
@@ -243,7 +251,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
                 ]);
             }
         },
-        |_| {} // Standalone glyphs (ignore for this spike)
+        |_| {}
     );
 
     log::info!("Generated {} vertices via suzuri", vertices.len());
