@@ -16,8 +16,8 @@ use android_raw_window::AndroidNativeWindow;
 use suzuri::{
     FontSystem,
     fontdb,
-    renderer::{GpuCacheConfig, AtlasUpdate, GlyphInstance},
-    text::{TextData, TextElement, TextLayoutConfig, Attrs},
+    renderer::{GpuCacheConfig, AtlasUpdate},
+    text::{TextData, TextElement, TextLayoutConfig},
 };
 
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
@@ -80,22 +80,18 @@ unsafe fn run_vulkan(window_ptr: usize) {
     log::info!("Starting Vulkan initialization...");
     let entry = Entry::load().expect("Failed to load Vulkan");
 
-    // --- 1. Unified Window Handle ---
     let native_window = AndroidNativeWindow(window_ptr as *mut _);
     let window_handle = native_window.window_handle().unwrap();
     let display_handle = native_window.display_handle().unwrap();
+    let raw_display_handle = display_handle.as_raw();
+    let raw_window_handle = window_handle.as_raw();
 
-    // --- 2. Vulkan Instance ---
     let app_name = CString::new("MossanicSpike").unwrap();
     let app_info = vk::ApplicationInfo {
         p_application_name: app_name.as_ptr(),
         api_version: vk::make_api_version(0, 1, 1, 0),
         ..Default::default()
     };
-
-    // FIX: ash-window expects RawDisplayHandle, not DisplayHandle
-    let raw_display_handle = display_handle.as_raw();
-    let raw_window_handle = window_handle.as_raw();
 
     let instance_exts = ash_window::enumerate_required_extensions(raw_display_handle).unwrap();
     let instance_create_info = vk::InstanceCreateInfo {
@@ -106,13 +102,10 @@ unsafe fn run_vulkan(window_ptr: usize) {
     };
     let instance = entry.create_instance(&instance_create_info, None).unwrap();
 
-    // --- 3. Create Surface via ash-window ---
-    // FIX: Pass raw handles, not the wrapper types
     let surface = ash_window::create_surface(&entry, &instance, raw_display_handle, raw_window_handle, None)
-        .expect("Failed to create Vulkan surface from raw-window-handle");
+        .expect("Failed to create Vulkan surface");
     let surface_ext = ash::khr::surface::Instance::new(&entry, &instance);
 
-    // --- 4. Device & Swapchain Setup ---
     let physical_device = instance.enumerate_physical_devices().unwrap()[0];
     let device_exts = [ash::khr::swapchain::NAME.as_ptr()];
     let queue_priorities = [1.0];
@@ -135,7 +128,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let mut width = caps.current_extent.width;
     let mut height = caps.current_extent.height;
     if width == u32::MAX || width == 0 {
-        // FIX: Use the android-raw-window helper methods, not raw pointer methods
         width = native_window.get_width();
         height = native_window.get_height();
     }
@@ -154,7 +146,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let swapchain = swapchain_loader.create_swapchain(&swapchain_create_info, None).unwrap();
     let images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
 
-    // --- 5. Render Pass & Framebuffers ---
     let attachments = [vk::AttachmentDescription {
         format: format.format, samples: vk::SampleCountFlags::TYPE_1,
         load_op: vk::AttachmentLoadOp::CLEAR, store_op: vk::AttachmentStoreOp::STORE,
@@ -173,11 +164,9 @@ unsafe fn run_vulkan(window_ptr: usize) {
         framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width, height, layers: 1, ..Default::default() }, None).unwrap());
     }
 
-    // --- 6. Suzuri Text Layout & Rasterization ---
+    // --- Suzuri Text Layout & Rasterization ---
     let font_system = FontSystem::new();
-    
-    // FIX: Use load_font_data directly on FontSystem, not db_mut()
-    font_system.load_font_data(include_bytes!("../assets/JetBrainsMono.ttf").to_vec());
+    font_system.load_font_binary(include_bytes!("../assets/JetBrainsMono.ttf").to_vec());
 
     let cache_configs = [GpuCacheConfig {
         texture_size: NonZeroUsize::new(1024).unwrap(),
@@ -186,13 +175,20 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }];
     font_system.gpu_init(&cache_configs);
 
+    // Query the font ID by family name
+    let query = fontdb::Query {
+        families: &[fontdb::Family::Name("JetBrains Mono")],
+        ..Default::default()
+    };
+    let (font_id, _) = font_system.query(&query).expect("Font not found");
+
     let mut text_data = TextData::new();
-    // FIX: TextElement::new does not exist; use struct literal or default
     text_data.append(
         TextElement {
-            text: "hello world!".to_string(),
-            attrs: Attrs::new().family(fontdb::Family::Name("JetBrains Mono")),
-            ..Default::default()
+            font_id: Some(font_id), // Use Option<ID> if required
+            font_size: 64.0,
+            content: "hello world!".to_string(),
+            user_data: (),
         }
     );
     let layout = font_system.layout_text(&text_data, &TextLayoutConfig::default());
@@ -200,20 +196,17 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut atlas_updates: Vec<AtlasUpdate> = Vec::new();
 
-    // Extract geometry and texture data from Suzuri
     font_system.gpu_render(
         &layout,
         |updates| {
             for update in updates {
-                // FIX: AtlasUpdate is not Clone; we need to copy its data manually
-                // But since we need to own it for later upload, we clone the pixels vec
                 atlas_updates.push(AtlasUpdate {
                     texture_index: update.texture_index,
                     x: update.x,
                     y: update.y,
                     width: update.width,
                     height: update.height,
-                    pixels: update.pixels.clone(), // FIX: field is `pixels`, not `data`
+                    pixels: update.pixels.clone(), // FIX: field is `pixels`
                 });
             }
         },
@@ -224,7 +217,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
             let offset_y = (height as f32 - text_height) / 2.0;
 
             for instance in instances {
-                // FIX: GlyphInstance uses screen_rect and uv_rect (Box2D), not x/y/width/height
                 let screen = instance.screen_rect;
                 let uv = instance.uv_rect;
 
@@ -256,7 +248,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     log::info!("Generated {} vertices via suzuri", vertices.len());
 
-    // --- 7. Upload Atlas Texture ---
+    // --- Texture Upload (Atlas) ---
     let atlas_size = 1024;
     let image_info = vk::ImageCreateInfo {
         image_type: vk::ImageType::TYPE_2D, format: vk::Format::R8_UNORM,
@@ -274,7 +266,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo { command_pool: cmd_pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() }).unwrap()[0];
     device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
-    // Transition for transfer
     let barrier1 = vk::ImageMemoryBarrier {
         old_layout: vk::ImageLayout::UNDEFINED, new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         src_queue_family_index: vk::QUEUE_FAMILY_IGNORED, dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -283,17 +274,16 @@ unsafe fn run_vulkan(window_ptr: usize) {
     };
     device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier1]);
 
-    // Upload each atlas update (Suzuri gives us the exact regions to write)
     for update in atlas_updates {
-        let staging_info = vk::BufferCreateInfo { size: update.data.len() as u64, usage: vk::BufferUsageFlags::TRANSFER_SRC, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
+        let staging_info = vk::BufferCreateInfo { size: update.pixels.len() as u64, usage: vk::BufferUsageFlags::TRANSFER_SRC, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
         let staging_buffer = device.create_buffer(&staging_info, None).unwrap();
         let reqs = device.get_buffer_memory_requirements(staging_buffer);
         let idx = (0..mem_props.memory_type_count).find(|&i| (reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)).unwrap();
         let mem = device.allocate_memory(&vk::MemoryAllocateInfo { allocation_size: reqs.size, memory_type_index: idx, ..Default::default() }, None).unwrap();
         device.bind_buffer_memory(staging_buffer, mem, 0).unwrap();
         
-        let ptr = device.map_memory(mem, 0, update.data.len() as u64, vk::MemoryMapFlags::empty()).unwrap();
-        std::ptr::copy_nonoverlapping(update.data.as_ptr(), ptr as *mut u8, update.data.len());
+        let ptr = device.map_memory(mem, 0, update.pixels.len() as u64, vk::MemoryMapFlags::empty()).unwrap();
+        std::ptr::copy_nonoverlapping(update.pixels.as_ptr(), ptr as *mut u8, update.pixels.len());
         device.unmap_memory(mem);
 
         let region = vk::BufferImageCopy {
@@ -306,7 +296,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
         device.cmd_copy_buffer_to_image(cmd, staging_buffer, texture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
     }
 
-    // Transition for shader
     let barrier2 = vk::ImageMemoryBarrier {
         old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL, new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         src_queue_family_index: vk::QUEUE_FAMILY_IGNORED, dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -315,12 +304,10 @@ unsafe fn run_vulkan(window_ptr: usize) {
     };
     device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &[barrier2]);
 
-    // Image View & Sampler
     let view_info = vk::ImageViewCreateInfo { image: texture_image, view_type: vk::ImageViewType::TYPE_2D, format: vk::Format::R8_UNORM, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() };
     let texture_view = device.create_image_view(&view_info, None).unwrap();
     let sampler = device.create_sampler(&vk::SamplerCreateInfo { mag_filter: vk::Filter::LINEAR, min_filter: vk::Filter::LINEAR, ..Default::default() }, None).unwrap();
 
-    // --- 8. Vertex Buffer ---
     let vbuf_size = if vertices.is_empty() { std::mem::size_of::<Vertex>() as u64 } else { (vertices.len() * std::mem::size_of::<Vertex>()) as u64 };
     let vbuf_info = vk::BufferCreateInfo { size: vbuf_size, usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, sharing_mode: vk::SharingMode::EXCLUSIVE, ..Default::default() };
     let vertex_buffer = device.create_buffer(&vbuf_info, None).unwrap();
@@ -350,7 +337,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     device.wait_for_fences(&[upload_fence], true, u64::MAX).unwrap();
     device.destroy_fence(upload_fence, None);
 
-    // --- 9. Descriptors & Pipeline ---
+    // --- Descriptors & Pipeline ---
     let pool_info = vk::DescriptorPoolCreateInfo { max_sets: 1, pool_size_count: 1, p_pool_sizes: &vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 }, ..Default::default() };
     let descriptor_pool = device.create_descriptor_pool(&pool_info, None).unwrap();
     let layout_binding = vk::DescriptorSetLayoutBinding { binding: 0, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1, stage_flags: vk::ShaderStageFlags::FRAGMENT, ..Default::default() };
@@ -401,7 +388,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     };
     let pipeline = device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None).unwrap()[0];
 
-    // --- 10. Render Loop ---
     let sem_avail = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let sem_finish = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let fence = device.create_fence(&vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() }, None).unwrap();
