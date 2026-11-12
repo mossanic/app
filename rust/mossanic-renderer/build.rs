@@ -33,7 +33,7 @@ fn compile_shader(src: &str, dest_name: &str, stage: naga::ShaderStage, out_dir:
     let spv_options = naga::back::spv::Options::default();
     let mut writer = naga::back::spv::Writer::new(&spv_options).unwrap();
     let mut spv_words = Vec::new();
-    writer.write(&module, &info, None, &mut spv_words)
+    writer.write(&module, &info, None, &None, &mut spv_words)
         .unwrap_or_else(|e| panic!("Failed to write SPIR-V for {}: {:?}", src, e));
 
     let mut spv_bytes = Vec::with_capacity(spv_words.len() * 4);
