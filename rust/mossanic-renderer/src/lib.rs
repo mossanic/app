@@ -122,10 +122,14 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let mut width = caps.current_extent.width;
     let mut height = caps.current_extent.height;
     if width == u32::MAX || width == 0 {
-        let window = ndk::native_window::NativeWindow::from_ptr(window_ptr as *mut _);
+        // Wrap in ManuallyDrop so the native window refcount isn't decremented when this goes out of scope
+        let window = std::mem::ManuallyDrop::new(ndk::native_window::NativeWindow::from_ptr(
+            std::ptr::NonNull::new_unchecked(window_ptr as *mut _)
+        ));
         width = window.width() as u32;
         height = window.height() as u32;
     }
+
     log::info!("Extent: {}x{}", width, height);
 
     let swapchain_create_info = vk::SwapchainCreateInfoKHR {
@@ -140,6 +144,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
     let swapchain = swapchain_loader.create_swapchain(&swapchain_create_info, None).unwrap();
     let images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
+    
     log::info!("Swapchain created");
 
     let attachments = [vk::AttachmentDescription {
@@ -159,6 +164,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         let view = device.create_image_view(&vk::ImageViewCreateInfo { image: *image, view_type: vk::ImageViewType::TYPE_2D, format: format.format, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() }, None).unwrap();
         framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width, height, layers: 1, ..Default::default() }, None).unwrap());
     }
+    
     log::info!("Framebuffers created");
 
     // --- Font Rasterization ---
@@ -211,6 +217,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
             }
         }
     }
+    
     log::info!("Generated {} vertices", vertices.len());
 
     let cmd_pool = device.create_command_pool(&vk::CommandPoolCreateInfo { queue_family_index: 0, ..Default::default() }, None).unwrap();
@@ -301,6 +308,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let descriptor_sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo { descriptor_pool, descriptor_set_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() }).unwrap();
     let image_info = vk::DescriptorImageInfo { sampler, image_view: texture_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
     device.update_descriptor_sets(&[vk::WriteDescriptorSet { dst_set: descriptor_sets[0], dst_binding: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, p_image_info: &image_info, ..Default::default() }], &[]);
+    
     log::info!("Descriptors created");
 
     let mut vert_words = vec![0u32; (VERT_SPV.len() + 3) / 4];
@@ -310,6 +318,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     let vert_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: vert_words.len() * 4, p_code: vert_words.as_ptr(), ..Default::default() }, None).unwrap();
     let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: frag_words.len() * 4, p_code: frag_words.as_ptr(), ..Default::default() }, None).unwrap();
+    
     log::info!("Shaders created");
 
     let stages = [
@@ -324,7 +333,9 @@ unsafe fn run_vulkan(window_ptr: usize) {
    let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
     
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo { set_layout_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() };
-    log::info!("Creating Pipeline Layout...");
+    
+    log::info!("Creating Pipeline Layout...")
+;
     let pipeline_layout = match device.create_pipeline_layout(&pipeline_layout_info, None) {
         Ok(pl) => pl,
         Err(e) => { log::error!("FATAL: Failed to create pipeline layout: {:?}", e); return; }
@@ -345,10 +356,13 @@ unsafe fn run_vulkan(window_ptr: usize) {
     };
     
     log::info!("Creating Graphics Pipeline...");
+    
     let pipeline = match device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None) {
         Ok(pipelines) => {
             if pipelines.is_empty() {
+                
                 log::error!("FATAL: Graphics pipeline array is empty!");
+                
                 return;
             }
             pipelines[0]
