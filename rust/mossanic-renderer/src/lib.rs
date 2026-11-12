@@ -1,4 +1,4 @@
-wuse jni::objects::{JClass, JObject};
+use jni::objects::{JClass, JObject};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
