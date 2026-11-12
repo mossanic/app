@@ -224,7 +224,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let cache_configs = [GpuCacheConfig {
         texture_size: NonZeroUsize::new(1024).unwrap(),
         tile_size: NonZeroUsize::new(32).unwrap(),
-        tiles_per_axis: NonZeroUsize::new(32).unwrap(),
+        tiles_per_axis: NonZeroUsize::new(8).unwrap(), // 1024 / 128 = 8
     }];
     font_system.gpu_init(&cache_configs);
 
