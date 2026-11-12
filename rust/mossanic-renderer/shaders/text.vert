@@ -8,15 +8,16 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 void main() {
-    // Convert pixel coordinates (0..width, 0..height) to NDC (-1.0..1.0)
+    // Convert pixel coordinates (0..1928, 0..1416) to NDC (-1.0 to 1.0)
     vec2 ndc = (in_pos / pc.screen_size) * 2.0 - 1.0;
     
-    // In Vulkan, Y goes down. So we flip it.
+    // Flip Y axis for Vulkan
     ndc.y = -ndc.y;
 
-    // Apply rotation to fix the Android surface orientation (90 degrees clockwise)
-    vec2 rotated = vec2(-ndc.y, ndc.x);
+    // Rotate 90 degrees to fix the Android Surface orientation
+    // We swapped the signs here to fix the upside-down text
+    vec2 rotated = vec2(ndc.y, -ndc.x);
     
-    gl_Position = vec4(-rotated.x, -rotated.y, 0.0, 1.0);
+    gl_Position = vec4(rotated, 0.0, 1.0);
     out_uv = in_uv;
 }
