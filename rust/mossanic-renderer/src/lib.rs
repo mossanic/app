@@ -168,9 +168,9 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let font = swash::FontRef::from_index(font_data, 0).unwrap();
     let mut context = swash::scale::ScaleContext::new();
     
-    // FIX: Force hinting and remove explicit format
-    let mut scaler = context.builder(font).size(64.0).hint(true).build();
-    let mut render = swash::scale::Render::new(&[]);
+    // FIX: Add normalize(true) and explicitly request Source::Outline
+    let mut scaler = context.builder(font).size(64.0).hint(true).normalize(true).build();
+    let mut render = swash::scale::Render::new(&[swash::scale::Source::Outline]);
 
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
@@ -209,7 +209,9 @@ unsafe fn run_vulkan(window_ptr: usize) {
                 ]);
             }
             None => {
-                log::error!("  -> Failed to render glyph");
+                if c != ' ' {
+                    log::error!("  -> Failed to render glyph");
+                }
             }
         }
     }
@@ -314,7 +316,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let frag_module = device.create_shader_module(&vk::ShaderModuleCreateInfo { code_size: frag_words.len() * 4, p_code: frag_words.as_ptr(), ..Default::default() }, None).unwrap();
     log::info!("Shaders created");
 
-    // FIX: Bind CString to a variable so the pointer remains valid
     let main_name = CString::new("main").unwrap();
     let stages = [
         vk::PipelineShaderStageCreateInfo { stage: vk::ShaderStageFlags::VERTEX, module: vert_module, p_name: main_name.as_ptr(), ..Default::default() },
@@ -362,7 +363,10 @@ unsafe fn run_vulkan(window_ptr: usize) {
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
         device.reset_fences(&[fence]).unwrap();
-        let (idx, _) = swapchain_loader.acquire_next_image(swapchain, u64::MAX, sem_avail, vk::Fence::null()).unwrap();
+        
+        let acquire_result = swapchain_loader.acquire_next_image(swapchain, u64::MAX, sem_avail, vk::Fence::null());
+        if acquire_result.is_err() { break; }
+        let (idx, _) = acquire_result.unwrap();
 
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
@@ -381,10 +385,13 @@ unsafe fn run_vulkan(window_ptr: usize) {
         device.end_command_buffer(cmd).unwrap();
 
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        device.queue_submit(queue, &[vk::SubmitInfo { wait_semaphore_count: 1, p_wait_semaphores: &sem_avail, p_wait_dst_stage_mask: wait_stages.as_ptr(), command_buffer_count: 1, p_command_buffers: &cmd, signal_semaphore_count: 1, p_signal_semaphores: &sem_finish, ..Default::default() }], fence).unwrap();
+        let submit_result = device.queue_submit(queue, &[vk::SubmitInfo { wait_semaphore_count: 1, p_wait_semaphores: &sem_avail, p_wait_dst_stage_mask: wait_stages.as_ptr(), command_buffer_count: 1, p_command_buffers: &cmd, signal_semaphore_count: 1, p_signal_semaphores: &sem_finish, ..Default::default() }], fence);
+        if submit_result.is_err() { break; }
         
-        swapchain_loader.queue_present(queue, &vk::PresentInfoKHR { wait_semaphore_count: 1, p_wait_semaphores: &sem_finish, swapchain_count: 1, p_swapchains: &swapchain, p_image_indices: &(idx as u32), ..Default::default() }).unwrap();
+        let present_result = swapchain_loader.queue_present(queue, &vk::PresentInfoKHR { wait_semaphore_count: 1, p_wait_semaphores: &sem_finish, swapchain_count: 1, p_swapchains: &swapchain, p_image_indices: &(idx as u32), ..Default::default() });
+        if present_result.is_err() { break; }
     }
 
-    device.device_wait_idle().unwrap();
+    // FIX: Don't panic if the surface was destroyed while shutting down
+    let _ = device.device_wait_idle();
 }
