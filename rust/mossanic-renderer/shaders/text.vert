@@ -17,6 +17,6 @@ void main() {
     // Apply rotation to fix the Android surface orientation (90 degrees clockwise)
     vec2 rotated = vec2(-ndc.y, ndc.x);
     
-    gl_Position = vec4(rotated, 0.0, 1.0);
+    gl_Position = vec4(-rotated.x, -rotated.y, 0.0, 1.0);
     out_uv = in_uv;
 }
