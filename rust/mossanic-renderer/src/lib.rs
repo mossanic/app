@@ -241,9 +241,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
                 let settings = DrawSettings::unhinted(size, loc);
                 outline_glyph.draw(settings, &mut pen).unwrap();
 
-                let mask = Mask::new(&pen.0);
-                let placement = mask.placement();
-
+                // FIX: Use .render() to get the coverage bytes and Placement
+                let (mask_data, placement) = Mask::new(&pen.0).render();
                 let w = placement.width as usize;
                 let h = placement.height as usize;
 
@@ -251,7 +250,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
                     // Copy coverage mask to atlas
                     for y in 0..h {
                         for x in 0..w {
-                            atlas_data[y * 512 + (atlas_x + x)] = mask[y * w + x];
+                            atlas_data[y * 512 + (atlas_x + x)] = mask_data[y * w + x];
                         }
                     }
 
@@ -280,7 +279,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
             }
             x_cursor += advance + 2.0;
         }
-    }
+    }    
+
     log::info!("Generated {} vertices via skrifa+zeno", vertices.len());
 
     // --- Texture Setup ---
