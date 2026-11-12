@@ -93,7 +93,6 @@ unsafe fn run_vulkan(window_ptr: usize) {
         ..Default::default()
     };
     let instance = entry.create_instance(&instance_create_info, None).unwrap();
-    log::info!("Vulkan Instance created");
 
     let android_surface = ash::khr::android_surface::Instance::new(&entry, &instance);
     let surface_create_info = vk::AndroidSurfaceCreateInfoKHR { window: window_ptr as *mut _, ..Default::default() };
@@ -115,15 +114,24 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let device = instance.create_device(physical_device, &device_create_info, None).unwrap();
     let queue = device.get_device_queue(0, 0);
     let mem_props = instance.get_physical_device_memory_properties(physical_device);
-    log::info!("Vulkan Device created");
 
     let caps = surface_ext.get_physical_device_surface_capabilities(physical_device, surface).unwrap();
     let formats = surface_ext.get_physical_device_surface_formats(physical_device, surface).unwrap();
     let format = formats[0];
+    
+    let mut width = caps.current_extent.width;
+    let mut height = caps.current_extent.height;
+    if width == u32::MAX || width == 0 {
+        let window = ndk::native_window::NativeWindow::from_ptr(window_ptr as *mut _);
+        width = window.width() as u32;
+        height = window.height() as u32;
+    }
+    log::info!("Extent: {}x{}", width, height);
+
     let swapchain_create_info = vk::SwapchainCreateInfoKHR {
         surface, min_image_count: caps.min_image_count + 1,
         image_format: format.format, image_color_space: format.color_space,
-        image_extent: caps.current_extent, image_array_layers: 1,
+        image_extent: vk::Extent2D { width, height }, image_array_layers: 1,
         image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
         image_sharing_mode: vk::SharingMode::EXCLUSIVE,
         pre_transform: caps.current_transform, composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
@@ -149,58 +157,58 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let mut framebuffers = vec![];
     for image in &images {
         let view = device.create_image_view(&vk::ImageViewCreateInfo { image: *image, view_type: vk::ImageViewType::TYPE_2D, format: format.format, subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() }, ..Default::default() }, None).unwrap();
-        framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width: caps.current_extent.width, height: caps.current_extent.height, layers: 1, ..Default::default() }, None).unwrap());
+        framebuffers.push(device.create_framebuffer(&vk::FramebufferCreateInfo { render_pass, attachment_count: 1, p_attachments: &view, width, height, layers: 1, ..Default::default() }, None).unwrap());
     }
     log::info!("Framebuffers created");
 
-    // --- Debug Font Data ---
+    // --- Font Rasterization ---
     let font_data = include_bytes!("../assets/JetBrainsMono.ttf");
-    log::info!("Font file size: {} bytes", font_data.len());
-    log::info!("Font header: {:02X?}", &font_data[0..4]);
-
-    let font = match swash::FontRef::from_index(font_data, 0) {
-        Some(f) => f,
-        None => {
-            log::error!("FATAL: swash could not parse the font.");
-            return;
-        }
-    };
-
+    let font = swash::FontRef::from_index(font_data, 0).unwrap();
     let mut context = swash::scale::ScaleContext::new();
     let mut scaler = context.builder(font).size(64.0).build();
-    let mut render = swash::scale::Render::new(&[]);
     
+    let mut render = swash::scale::Render::new(&[]);
+    render.format(swash::zeno::Format::Alpha);
+
     let mut atlas_data = vec![0u8; 512 * 512];
     let mut vertices = Vec::new();
     let text = "hello world!";
 
     for (i, c) in text.chars().enumerate() {
         let glyph_id = font.charmap().map(c);
-        if let Some(image) = render.render(&mut scaler, glyph_id) {
-            let w = image.placement.width as usize;
-            let h = image.placement.height as usize;
-            if w == 0 || h == 0 { continue; }
+        log::info!("Char: '{}', GlyphID: {:?}", c, glyph_id);
+        
+        match render.render(&mut scaler, glyph_id) {
+            Some(image) => {
+                let w = image.placement.width as usize;
+                let h = image.placement.height as usize;
+                log::info!("  -> Size: {}x{}", w, h);
+                if w == 0 || h == 0 { continue; }
 
-            let ox = (i * 40) as i32 + 100;
-            let oy = 400;
-            let atlas_x = i * 64;
-            let atlas_y = 0;
-            
-            for y in 0..h {
-                for x in 0..w {
-                    atlas_data[(atlas_y + y) * 512 + (atlas_x + x)] = image.data[y * w + x];
+                let atlas_x = i * 64;
+                let atlas_y = 0;
+                for y in 0..h {
+                    for x in 0..w {
+                        atlas_data[(atlas_y + y) * 512 + (atlas_x + x)] = image.data[y * w + x];
+                    }
                 }
+                
+                let u0 = atlas_x as f32 / 512.0; let v0 = atlas_y as f32 / 512.0;
+                let u1 = (atlas_x + w) as f32 / 512.0; let v1 = (atlas_y + h) as f32 / 512.0;
+                
+                let x0 = -0.8 + (i as f32 * 0.1);
+                let y0 = -0.1;
+                let x1 = x0 + 0.08;
+                let y1 = y0 + 0.2;
+                
+                vertices.extend_from_slice(&[
+                    Vertex { pos: [x0, y0], uv: [u0, v0] }, Vertex { pos: [x1, y0], uv: [u1, v0] }, Vertex { pos: [x0, y1], uv: [u0, v1] },
+                    Vertex { pos: [x1, y0], uv: [u1, v0] }, Vertex { pos: [x1, y1], uv: [u1, v1] }, Vertex { pos: [x0, y1], uv: [u0, v1] },
+                ]);
             }
-            
-            let u0 = atlas_x as f32 / 512.0; let v0 = atlas_y as f32 / 512.0;
-            let u1 = (atlas_x + w) as f32 / 512.0; let v1 = (atlas_y + h) as f32 / 512.0;
-            let px0 = ox as f32; let py0 = oy as f32;
-            let px1 = (ox + w as i32) as f32; let py1 = (oy + h as i32) as f32;
-            
-            vertices.extend_from_slice(&[
-                Vertex { pos: [px0, py0], uv: [u0, v0] }, Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
-                Vertex { pos: [px1, py0], uv: [u1, v0] }, Vertex { pos: [px1, py1], uv: [u1, v1] }, Vertex { pos: [px0, py1], uv: [u0, v1] },
-            ]);
+            None => {
+                log::error!("  -> Failed to render glyph");
+            }
         }
     }
     log::info!("Generated {} vertices", vertices.len());
@@ -280,13 +288,11 @@ unsafe fn run_vulkan(window_ptr: usize) {
     }
     
     device.end_command_buffer(cmd).unwrap();
-    log::info!("Command buffer recorded");
 
     let upload_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
     device.queue_submit(queue, &[vk::SubmitInfo { command_buffer_count: 1, p_command_buffers: &cmd, ..Default::default() }], upload_fence).unwrap();
     device.wait_for_fences(&[upload_fence], true, u64::MAX).unwrap();
     device.destroy_fence(upload_fence, None);
-    log::info!("Buffers and textures uploaded");
 
     let pool_info = vk::DescriptorPoolCreateInfo { max_sets: 1, pool_size_count: 1, p_pool_sizes: &vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 }, ..Default::default() };
     let descriptor_pool = device.create_descriptor_pool(&pool_info, None).unwrap();
@@ -315,13 +321,17 @@ unsafe fn run_vulkan(window_ptr: usize) {
         vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 0 },
         vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 8 },
     ];
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
+   let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
     
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo { set_layout_count: 1, p_set_layouts: &descriptor_layout, ..Default::default() };
-    let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None).unwrap();
+    log::info!("Creating Pipeline Layout...");
+    let pipeline_layout = match device.create_pipeline_layout(&pipeline_layout_info, None) {
+        Ok(pl) => pl,
+        Err(e) => { log::error!("FATAL: Failed to create pipeline layout: {:?}", e); return; }
+    };
 
-    let viewport = [vk::Viewport { x: 0.0, y: 0.0, width: caps.current_extent.width as f32, height: caps.current_extent.height as f32, min_depth: 0.0, max_depth: 1.0 }];
-    let scissor = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: caps.current_extent }];
+    let viewport = [vk::Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 }];
+    let scissor = [vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } }];
     let viewport_state = vk::PipelineViewportStateCreateInfo { viewport_count: 1, p_viewports: viewport.as_ptr(), scissor_count: 1, p_scissors: scissor.as_ptr(), ..Default::default() };
     
     let pipeline_info = vk::GraphicsPipelineCreateInfo {
@@ -333,7 +343,21 @@ unsafe fn run_vulkan(window_ptr: usize) {
         p_color_blend_state: &vk::PipelineColorBlendStateCreateInfo { attachment_count: 1, p_attachments: &vk::PipelineColorBlendAttachmentState { blend_enable: vk::TRUE, src_color_blend_factor: vk::BlendFactor::SRC_ALPHA, dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA, color_write_mask: vk::ColorComponentFlags::RGBA, ..Default::default() }, ..Default::default() },
         layout: pipeline_layout, render_pass, subpass: 0, ..Default::default()
     };
-    let pipeline = device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None).unwrap()[0];
+    
+    log::info!("Creating Graphics Pipeline...");
+    let pipeline = match device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None) {
+        Ok(pipelines) => {
+            if pipelines.is_empty() {
+                log::error!("FATAL: Graphics pipeline array is empty!");
+                return;
+            }
+            pipelines[0]
+        },
+        Err((_, err)) => {
+            log::error!("FATAL: Failed to create graphics pipeline: {:?}", err);
+            return;
+        }
+    };
     log::info!("Graphics Pipeline created");
 
     let sem_avail = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
@@ -351,7 +375,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
         
         let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.1, 1.0] } }];
-        device.cmd_begin_render_pass(cmd, &vk::RenderPassBeginInfo { render_pass, framebuffer: framebuffers[idx as usize], render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: caps.current_extent }, clear_value_count: 1, p_clear_values: clear.as_ptr(), ..Default::default() }, vk::SubpassContents::INLINE);
+        device.cmd_begin_render_pass(cmd, &vk::RenderPassBeginInfo { render_pass, framebuffer: framebuffers[idx as usize], render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } }, clear_value_count: 1, p_clear_values: clear.as_ptr(), ..Default::default() }, vk::SubpassContents::INLINE);
         
         if !vertices.is_empty() {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
