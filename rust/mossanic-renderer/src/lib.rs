@@ -244,8 +244,8 @@ unsafe fn run_vulkan(window_ptr: usize) {
         }
     );
     let layout = font_system.layout_text(&text_data, &TextLayoutConfig {
-        max_width: f32::INFINITY,
-        max_height: f32::INFINITY,
+        max_height: Some(f32::INFINITY),
+        max_height: Some(f32::INFINITY),
         ..Default::default()
     });
 
