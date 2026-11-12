@@ -169,7 +169,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let mut context = swash::scale::ScaleContext::new();
     
     // FIX: Add normalize(true) and explicitly request Source::Outline
-    let mut scaler = context.builder(font).size(64.0).hint(true).normalize(true).build();
+    let mut scaler = context.builder(font).size(64.0).hint(true).build();
     let mut render = swash::scale::Render::new(&[swash::scale::Source::Outline]);
 
     let mut atlas_data = vec![0u8; 512 * 512];
