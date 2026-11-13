@@ -19,7 +19,6 @@ once_cell = "1.20"
 bytemuck = { version = "1.14", features = ["derive"] }
 
 # Text Rendering
-suzuri = "0.2"
 skrifa = "0.22"
 zeno = "0.3"
 
