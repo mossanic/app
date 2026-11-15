@@ -5,5 +5,6 @@ layout(binding = 0) uniform sampler2D font_tex;
 
 void main() {
     float alpha = texture(font_tex, out_uv).r;
+    // Output white text
     out_color = vec4(1.0, 1.0, 1.0, alpha);
 }
