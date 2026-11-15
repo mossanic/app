@@ -9,7 +9,7 @@ use ash::vk;
 use ash::Entry;
 use bytemuck::{Pod, Zeroable};
 use mossanic_pty::Pty;
-use m2s2_math::Matrix4x4f32;
+use m2s2_math::{Matrix4x4f32, Transform4x4};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use android_raw_window::AndroidNativeWindow;
