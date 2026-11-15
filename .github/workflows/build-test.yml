@@ -81,7 +81,7 @@ jobs:
     - name: Install Shaderc
       run: |
         sudo apt-get update
-        sudo apt-get install -y libshaderc-dev
+        sudo apt-get install -y glslc || sudo apt-get install -y glslang-tools shaderc
 
     - name: Build with Gradle
       run: |
