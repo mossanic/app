@@ -8,9 +8,10 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 void main() {
-    // Convert pixel coordinates to NDC
-    vec2 ndc = (in_pos / pc.screen_size) * 2.0 - 1.0;
-    // Vulkan Y goes down, so we flip Y
-    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+    // Convert pixel coords to Normalized Device Coordinates (NDC)
+    float x = (in_pos.x / pc.screen_size.x) * 2.0 - 1.0;
+    float y = (in_pos.y / pc.screen_size.y) * 2.0 - 1.0;
+    
+    gl_Position = vec4(x, y, 0.0, 1.0);
     out_uv = in_uv;
 }
