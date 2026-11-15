@@ -140,7 +140,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     };
     let device = instance.create_device(physical_device, &device_create_info, None).unwrap();
     let queue = device.get_device_queue(0, 0);
-    let _ mem_props = instance.get_physical_device_memory_properties(physical_device);
+    let _mem_props = instance.get_physical_device_memory_properties(physical_device);
 
     let caps = surface_ext.get_physical_device_surface_capabilities(physical_device, surface).unwrap();
     let formats = surface_ext.get_physical_device_surface_formats(physical_device, surface).unwrap();
