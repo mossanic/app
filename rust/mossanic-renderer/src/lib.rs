@@ -16,7 +16,9 @@ use android_raw_window::AndroidNativeWindow;
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
+#[allow(dead_code)]
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
+#[allow(dead_code)]
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
 
 #[repr(C)]
@@ -138,7 +140,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
     };
     let device = instance.create_device(physical_device, &device_create_info, None).unwrap();
     let queue = device.get_device_queue(0, 0);
-    let mem_props = instance.get_physical_device_memory_properties(physical_device);
+    let _ mem_props = instance.get_physical_device_memory_properties(physical_device);
 
     let caps = surface_ext.get_physical_device_surface_capabilities(physical_device, surface).unwrap();
     let formats = surface_ext.get_physical_device_surface_formats(physical_device, surface).unwrap();
