@@ -9,6 +9,7 @@ use ash::vk;
 use ash::Entry;
 use bytemuck::{Pod, Zeroable};
 use mossanic_pty::Pty;
+use m2s2_math::Matrix4x4f32;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use android_raw_window::AndroidNativeWindow;
@@ -19,9 +20,7 @@ use font::FONT_DATA;
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
-#[allow(dead_code)]
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
-#[allow(dead_code)]
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
 
 #[repr(C)]
@@ -123,7 +122,6 @@ pub extern "system" fn Java_org_mossanic_app_NativeBridge_startShell(
         };
 
         log::info!("PTY spawned successfully.");
-        // Give the shell a moment to initialize, then send a command
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = pty.write(b"echo Hello from mossanic-pty!\n");
 
@@ -254,7 +252,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
 
     // --- Generate Vertices from ScreenBuffer ---
     let mut vertices: Vec<Vertex> = Vec::new();
-    let cell_w = 16.0; // Scale 8x8 font up 2x
+    let cell_w = 16.0; 
     let cell_h = 16.0;
     
     let screen = SCREEN.lock().unwrap();
@@ -285,7 +283,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
             }
         }
     }
-    drop(screen); // release lock
+    drop(screen); 
 
     // --- Upload Texture ---
     let image_info = vk::ImageCreateInfo {
@@ -398,9 +396,10 @@ unsafe fn run_vulkan(window_ptr: usize) {
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo { vertex_binding_description_count: 1, p_vertex_binding_descriptions: binding_desc.as_ptr(), vertex_attribute_description_count: 2, p_vertex_attribute_descriptions: attr_desc.as_ptr(), ..Default::default() };
 
+    // Push constant size is now 64 bytes (mat4)
     let push_constant_range = vk::PushConstantRange {
         stage_flags: vk::ShaderStageFlags::VERTEX,
-        offset: 0, size: 8,
+        offset: 0, size: 64, 
     };
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
         set_layout_count: 1, p_set_layouts: &descriptor_layout,
@@ -428,10 +427,24 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let sem_finish = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
     let fence = device.create_fence(&vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() }, None).unwrap();
 
-    let push_constants = [width as f32, height as f32];
-    let push_constants_bytes = std::slice::from_raw_parts(push_constants.as_ptr() as *const u8, 8);
+    // --- Create Projection Matrix with m2s2-math ---
+    // Vulkan Y goes down, so we map 0..height to the Y coordinates.
+    // We transpose it to convert from row-major to column-major for Vulkan.
+    let proj = Matrix4x4f32::ortho_rh_zo(
+        0.0,          // left
+        width as f32, // right
+        height as f32,// bottom (which is Y=0 in Vulkan NDC)
+        0.0,          // top
+        0.0,          // near
+        1.0,          // far
+    ).transpose();
 
-    log::info!("Entering render loop (Bitmap Terminal).");
+    let proj_bytes = std::slice::from_raw_parts(
+        &proj as *const _ as *const u8,
+        64, // 4x4 * 4 bytes = 64
+    );
+
+    log::info!("Entering render loop (Bitmap Terminal with m2s2-math).");
 
     while !SHOULD_CLOSE.load(Ordering::SeqCst) {
         device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
@@ -451,7 +464,10 @@ unsafe fn run_vulkan(window_ptr: usize) {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[descriptor_sets[0]], &[]);
-            device.cmd_push_constants(cmd, pipeline_layout, vk::ShaderStageFlags::VERTEX, 0, push_constants_bytes);
+            
+            // Push the 64-byte matrix instead of the 8-byte screen size
+            device.cmd_push_constants(cmd, pipeline_layout, vk::ShaderStageFlags::VERTEX, 0, proj_bytes);
+            
             device.cmd_draw(cmd, vertices.len() as u32, 1, 0, 0);
         }
 
