@@ -461,7 +461,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
-        let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.1, 1.0] } }];
+        let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.1] } }];
         device.cmd_begin_render_pass(cmd, &vk::RenderPassBeginInfo { render_pass, framebuffer: framebuffers[idx as usize], render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } }, clear_value_count: 1, p_clear_values: clear.as_ptr(), ..Default::default() }, vk::SubpassContents::INLINE);
 
         if !vertices.is_empty() {
