@@ -437,7 +437,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         0.0,          // top
         0.0,          // near
         1.0,          // far
-    ).transpose();
+    );
 
     let proj_bytes = std::slice::from_raw_parts(
         &proj as *const _ as *const u8,
