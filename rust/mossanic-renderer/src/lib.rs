@@ -428,16 +428,22 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let fence = device.create_fence(&vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() }, None).unwrap();
 
     // --- Create Projection Matrix with m2s2-math ---
-    // Vulkan Y goes down, so we map 0..height to the Y coordinates.
-    // We transpose it to convert from row-major to column-major for Vulkan.
-    let proj = Matrix4x4f32::ortho_rh_zo(
-        0.0,          // left
-        width as f32, // right
-        height as f32,// bottom (which is Y=0 in Vulkan NDC)
-        0.0,          // top
-        0.0,          // near
-        1.0,          // far
-    );
+    // We construct the orthographic matrix manually to ensure exact Vulkan compatibility.
+    // Maps X: 0 to width -> -1 to 1
+    // Maps Y: 0 to height -> -1 to 1 (Vulkan NDC has Y pointing down, so 0 is top)
+    let w = width as f32;
+    let h = height as f32;
+
+    // Row-major format
+    let proj_row_major = Matrix4x4f32::from_slice(&[
+        2.0 / w, 0.0,     0.0, -1.0,
+        0.0,     2.0 / h, 0.0, -1.0,
+        0.0,     0.0,     1.0,  0.0,
+        0.0,     0.0,     0.0,  1.0,
+    ]);
+
+    // Transpose to column-major for Vulkan
+    let proj = proj_row_major.transpose();
 
     let proj_bytes = std::slice::from_raw_parts(
         &proj as *const _ as *const u8,
