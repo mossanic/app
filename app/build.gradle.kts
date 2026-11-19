@@ -6,11 +6,11 @@ plugins {
 }
 
 android {
-    namespace = "org.mossanic.app"
+    namespace = "org.mossanic"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "org.mossanic.app"
+        applicationId = "org.mossanic"
         minSdk = 26
         targetSdk = 28 // Critical for exec() later
         versionCode = 1

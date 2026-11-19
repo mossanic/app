@@ -1,4 +1,4 @@
-package org.mossanic.app
+package org.mossanic
 
 import android.app.Activity
 import android.os.Bundle

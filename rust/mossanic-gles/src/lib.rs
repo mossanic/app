@@ -12,7 +12,7 @@ static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
-pub extern "system" fn Java_org_mossanic_app_NativeBridge_setSurfaceGLES(
+pub extern "system" fn Java_org_mossanic_NativeBridge_setSurfaceGLES(
     env: JNIEnv,
     _class: JClass,
     surface: JObject,

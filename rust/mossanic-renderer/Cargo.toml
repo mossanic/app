@@ -19,3 +19,4 @@ once_cell = "1.20"
 bytemuck = { version = "1.14", features = ["derive"] }
 mossanic-pty = { git = "https://github.com/mossanic/pty" }
 m2s2-math = "0.2"
+mossanic-terminal-core = { path = "../mossanic-terminal-core" }
