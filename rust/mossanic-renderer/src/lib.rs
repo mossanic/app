@@ -15,8 +15,12 @@ use android_raw_window::AndroidNativeWindow;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 mod font;
+mod surface_transform;
 mod text_grid;
 use font::FONT_DATA;
+use surface_transform::{
+    pre_rotation as surface_pre_rotation, swaps_extent as surface_transform_swaps_extent,
+};
 use text_grid::{build_grid_vertices_into, Vertex, ATLAS_HEIGHT, ATLAS_WIDTH};
 
 static VULKAN_INIT: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
@@ -295,16 +299,27 @@ unsafe fn run_vulkan(window_ptr: usize) {
         panic!("Surface images cannot be used as color attachments");
     }
 
-    let (width, height) = if caps.current_extent.width != u32::MAX {
-        (caps.current_extent.width, caps.current_extent.height)
+    let surface_extent = if caps.current_extent.width != u32::MAX {
+        caps.current_extent
     } else {
-        (
-            (native_window.get_width().max(1) as u32)
+        vk::Extent2D {
+            width: (native_window.get_width().max(1) as u32)
                 .clamp(caps.min_image_extent.width, caps.max_image_extent.width),
-            (native_window.get_height().max(1) as u32)
+            height: (native_window.get_height().max(1) as u32)
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
-        )
+        }
     };
+    let (width, height) = if surface_transform_swaps_extent(caps.current_transform) {
+        (surface_extent.height, surface_extent.width)
+    } else {
+        (surface_extent.width, surface_extent.height)
+    };
+    log::info!(
+        "Surface transform=0x{:x}; pre-rotated swapchain extent={}x{}",
+        caps.current_transform.as_raw(),
+        width,
+        height
+    );
     let image_count = if caps.max_image_count > 0 {
         caps.min_image_count
             .saturating_add(1)
@@ -331,6 +346,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         image_array_layers: 1,
         image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
         image_sharing_mode: vk::SharingMode::EXCLUSIVE,
+        // Android pre-rotation: the projection below applies current_transform.
         pre_transform: caps.current_transform,
         composite_alpha,
         present_mode,
@@ -959,8 +975,9 @@ unsafe fn run_vulkan(window_ptr: usize) {
     let w = width as f32;
     let h = height as f32;
 
-    // Row-major format
-    let proj_row_major = Matrix4x4f32::from_slice(&[
+    // Row-major format. Surface pre-rotation is applied in clip space because
+    // the swapchain preTransform matches the Android surface currentTransform.
+    let orthographic_row_major = Matrix4x4f32::from_slice(&[
         2.0 / w,
         0.0,
         0.0,
@@ -978,6 +995,7 @@ unsafe fn run_vulkan(window_ptr: usize) {
         0.0,
         1.0,
     ]);
+    let proj_row_major = surface_pre_rotation(caps.current_transform) * orthographic_row_major;
 
     // Transpose to column-major for Vulkan
     let proj = proj_row_major.transpose();
